@@ -845,8 +845,17 @@ install_opencode() {
     patchelf --set-rpath "$RPATH" "$new_bin" || fail "patchelf rpath 失败"
 
     # 验证能跑才替换
-    if ! "$new_bin" --version >/dev/null 2>&1; then
-        fail "新二进制验证失败, 已放弃替换"
+    # 无 root 时 musl 二进制被 Android seccomp 拦截 → Bad system call, 需走 proot
+    local verify_ok=0
+    if command -v sudo >/dev/null 2>&1 && sudo -n true 2>/dev/null; then
+        "$new_bin" --version >/dev/null 2>&1 && verify_ok=1
+    elif command -v proot >/dev/null 2>&1; then
+        proot -b "${PREFIX}/etc/resolv.conf:/etc/resolv.conf" "$new_bin" --version >/dev/null 2>&1 && verify_ok=1
+    else
+        "$new_bin" --version >/dev/null 2>&1 && verify_ok=1
+    fi
+    if [ "$verify_ok" -ne 1 ]; then
+        fail "新二进制验证失败 (如无 root 请确保已安装 proot), 已放弃替换"
     fi
 
     mkdir -p "$OPENCODE_DIR"
@@ -925,12 +934,24 @@ download_asset() {
     return 1
 }
 
+# 运行 opencode 二进制: 有 root 直跑, 无 root 走 proot (避免 seccomp 拦截 musl 系统调用)
+run_opencode() {
+    local bin="$1"; shift
+    if command -v sudo >/dev/null 2>&1 && sudo -n true 2>/dev/null; then
+        "$bin" "$@"
+    elif command -v proot >/dev/null 2>&1; then
+        proot -b "${PREFIX}/etc/resolv.conf:/etc/resolv.conf" "$bin" "$@"
+    else
+        "$bin" "$@"
+    fi
+}
+
 # 本地已记录版本; 无记录时从二进制本身探测 (可能为空)
 current_version() {
     if [ -f "$VERSION_FILE" ]; then
         cat "$VERSION_FILE"
     else
-        "$REAL_BIN" --version 2>/dev/null \
+        run_opencode "$REAL_BIN" --version 2>/dev/null \
             | grep -oE '[0-9]+(\.[0-9]+){1,3}' | head -n1 || true
     fi
 }
@@ -964,14 +985,14 @@ do_update() {
     patchelf --set-rpath "$RPATH" "$NEW_BIN" || return 1
 
     # 验证能跑再替换; 失败则保留旧二进制
-    if ! "$NEW_BIN" --version >/dev/null 2>&1; then
+    if ! run_opencode "$NEW_BIN" --version >/dev/null 2>&1; then
         echo "!! 新二进制无法运行, 已回滚(旧版保留)" >&2
         return 1
     fi
     mv -f "$NEW_BIN" "$REAL_BIN" || return 1
     chmod +x "$REAL_BIN"
     echo "$VERSION" > "$VERSION_FILE"
-    echo "✓ 更新完成: $("$REAL_BIN" --version)"
+    echo "✓ 更新完成: $(run_opencode "$REAL_BIN" --version)"
 }
 
 case "${1:-}" in
@@ -1011,7 +1032,14 @@ case "${1:-}" in
                 fi
             fi
         fi
-        exec "$REAL_BIN" "$@"
+        # exec 不能调 bash 函数, 内联 proot 逻辑
+        if command -v sudo >/dev/null 2>&1 && sudo -n true 2>/dev/null; then
+            exec "$REAL_BIN" "$@"
+        elif command -v proot >/dev/null 2>&1; then
+            exec proot -b "${PREFIX}/etc/resolv.conf:/etc/resolv.conf" "$REAL_BIN" "$@"
+        else
+            exec "$REAL_BIN" "$@"
+        fi
         ;;
 esac
 WRAPPER_EOF

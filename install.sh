@@ -846,13 +846,14 @@ install_opencode() {
 
     # 验证能跑才替换
     # 无 root 时 musl 二进制被 Android seccomp 拦截 → Bad system call, 需走 proot
+    local verify_env="env -u LD_PRELOAD SSL_CERT_FILE=${SSL_CERT_FILE:-$PREFIX/etc/tls/cert.pem}"
     local verify_ok=0
-    if command -v sudo >/dev/null 2>&1 && sudo -n true 2>/dev/null; then
-        "$new_bin" --version >/dev/null 2>&1 && verify_ok=1
-    elif command -v proot >/dev/null 2>&1; then
-        proot -b "${PREFIX}/etc/resolv.conf:/etc/resolv.conf" "$new_bin" --version >/dev/null 2>&1 && verify_ok=1
-    else
-        "$new_bin" --version >/dev/null 2>&1 && verify_ok=1
+    if command -v proot >/dev/null 2>&1; then
+        proot -b "${PREFIX}/etc/resolv.conf:/etc/resolv.conf" \
+            $verify_env "$new_bin" --version >/dev/null 2>&1 && verify_ok=1
+    fi
+    if [ "$verify_ok" -eq 0 ]; then
+        $verify_env "$new_bin" --version >/dev/null 2>&1 && verify_ok=1
     fi
     if [ "$verify_ok" -ne 1 ]; then
         fail "新二进制验证失败 (如无 root 请确保已安装 proot), 已放弃替换"
@@ -937,12 +938,13 @@ download_asset() {
 # 运行 opencode 二进制: 有 root 直跑, 无 root 走 proot (避免 seccomp 拦截 musl 系统调用)
 run_opencode() {
     local bin="$1"; shift
+    local _env="env -u LD_PRELOAD SSL_CERT_FILE=${SSL_CERT_FILE:-$PREFIX/etc/tls/cert.pem}"
     if command -v sudo >/dev/null 2>&1 && sudo -n true 2>/dev/null; then
-        "$bin" "$@"
+        $_env "$bin" "$@"
     elif command -v proot >/dev/null 2>&1; then
-        proot -b "${PREFIX}/etc/resolv.conf:/etc/resolv.conf" "$bin" "$@"
+        proot -b "${PREFIX}/etc/resolv.conf:/etc/resolv.conf" $_env "$bin" "$@"
     else
-        "$bin" "$@"
+        $_env "$bin" "$@"
     fi
 }
 

@@ -890,7 +890,8 @@ install_opencode() {
     for url in \
         "https://gh-proxy.com/https://github.com/$REPO/releases/download/$version/$ASSET" \
         "https://github.com/$REPO/releases/download/$version/$ASSET"; do
-        if curl -fsSL --connect-timeout 15 --max-time 300 "$url" -o "$work/$ASSET" 2>/dev/null; then
+        # 不用 -s: 保留 curl 的进度条
+        if curl -fSL --progress-bar --connect-timeout 15 --max-time 600 "$url" -o "$work/$ASSET"; then
             dl=1; break
         fi
     done
@@ -990,7 +991,7 @@ download_asset() {
     for url in \
         "https://gh-proxy.com/https://github.com/$REPO/releases/download/$ver/$ASSET" \
         "https://github.com/$REPO/releases/download/$ver/$ASSET"; do
-        if curl -fsSL --max-time 300 "$url" -o "$out" 2>/dev/null; then
+        if curl -fSL --progress-bar --connect-timeout 15 --max-time 600 "$url" -o "$out"; then
             return 0
         fi
     done

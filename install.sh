@@ -92,33 +92,49 @@ apk_mirror_host() { local h="${1#https://}"; printf '%s' "${h%%/*}"; }
 alpine_select_mirror() {
     local m
     for m in "${ALPINE_MIRRORS[@]}"; do
-        if curl -fsSL --connect-timeout 8 --max-time 30 "$m/APKINDEX.tar.gz" -o "$1" 2>/dev/null; then
+        if curl -fsSL --connect-timeout 8 --max-time 30 "$m/APKINDEX.tar.gz" -o "$1"; then
             ALPINE_BASE="$m"
             ok "Alpine 镜像: $(apk_mirror_host "$m")"
             return 0
         fi
+        warn "镜像不可用: $(apk_mirror_host "$m")"
     done
     fail "所有 Alpine 镜像都取不到 APKINDEX (网络问题?)"
 }
 
-# $1=索引路径 $2=包名 → 输出当前版本号
+# $1=索引路径 $2=包名 → 当前版本号; 解析失败则输出空串。
+# 关键: 不能让 set -e 因为 pipeline 非零而"静默"退出 —— 曾出现过
+# "没有任何报错、脚本直接结束" 的情况 (某些 tar 不认 apk 的扩展头会报错退出)。
 alpine_version() {
-    tar -xzOf "$1" APKINDEX 2>/dev/null \
-        | awk -F: -v p="$2" '$1=="P" && $2==p {f=1; next} f && $1=="V" {print $2; exit}'
+    local idx="$1" pkg="$2" out=""
+    # 注意: awk 打完就 exit, tar 会收到 SIGPIPE(141); 在 pipefail 下整条 pipeline 非零,
+    # 若写成 `out=$(...) || out=""` 会把已经取到的值清空, 且 set -e 会让脚本"静默结束"。
+    # 因此一律用 `|| true`: 保留已捕获的输出, 只吃掉非零退出码。
+    out=$( { tar -xzOf "$idx" APKINDEX 2>/dev/null || true; } \
+        | awk -F: -v p="$pkg" '$1=="P" && $2==p {f=1; next} f && $1=="V" {print $2; exit}') || true
+    # 回退: 用 gzip 先解压再喂给 tar, 绕开 tar 对 APK-TOOLS.checksum.SHA1 扩展头的处理差异
+    [ -n "$out" ] || out=$( { gzip -dc "$idx" 2>/dev/null || true; } | tar -xOf - APKINDEX 2>/dev/null \
+        | awk -F: -v p="$pkg" '$1=="P" && $2==p {f=1; next} f && $1=="V" {print $2; exit}') || true
+    printf '%s' "$out"
 }
 
 # $1=索引路径 $2=包名 $3=输出文件
 alpine_fetch_apk() {
-    local ver m
-    ver="$(alpine_version "$1" "$2")"
-    [ -n "$ver" ] || fail "APKINDEX 里解析不到 $2 的版本号"
+    local idx="$1" pkg="$2" out="$3" ver="" m
+    ver="$(alpine_version "$idx" "$pkg")" || true
+    if [ -z "$ver" ]; then
+        warn "解析 $pkg 版本号失败, 下面是 tar 的真实输出:"
+        tar -xzOf "$idx" APKINDEX >/dev/null || true
+        fail "无法从 APKINDEX 解析 $pkg 的版本号"
+    fi
     for m in "${ALPINE_MIRRORS[@]}"; do
-        if curl -fsSL --connect-timeout 10 --max-time 120 "$m/$2-$ver.apk" -o "$3" 2>/dev/null; then
-            info "$2-$ver.apk ← $(apk_mirror_host "$m")"
+        if curl -fsSL --connect-timeout 10 --max-time 120 "$m/$pkg-$ver.apk" -o "$out"; then
+            info "$pkg-$ver.apk ← $(apk_mirror_host "$m")"
             return 0
         fi
+        warn "$pkg-$ver.apk 下载失败: $(apk_mirror_host "$m")"
     done
-    fail "$2.apk 下载失败 (已试 ${#ALPINE_MIRRORS[@]} 个镜像)"
+    fail "$pkg.apk 下载失败 (已试 ${#ALPINE_MIRRORS[@]} 个镜像)"
 }
 
 # 需要: ld-musl-aarch64.so.1 + libstdc++.so.6 + libgcc_s.so.1

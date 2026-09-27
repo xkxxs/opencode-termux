@@ -881,7 +881,10 @@ install_opencode() {
 
     local work
     work=$(mktemp -d "${TMPDIR:-$PREFIX/tmp}/opencode.XXXXXX")
-    trap 'rm -rf "$work"' RETURN
+    # 双引号: 路径在设置时立即展开成字面量。
+    # 单引号版本会在函数返回时才求值, 而 RETURN trap 会泄漏到调用方
+    # (调用方返回时再次触发), 那时 $work 已出作用域 → set -u 报 unbound variable。
+    trap "rm -rf '$work'" RETURN
     info "下载 $ASSET ($version, 约 50MB)…"
     local dl=0
     for url in \
@@ -1029,7 +1032,8 @@ do_update() {
     echo "==> 下载 $ASSET ($VERSION, 约 50MB, 可能较慢) …"
     local TMP
     TMP="$(mktemp -d "${TMPDIR:-$HOME}/.opencode-update.XXXXXX")" || return 1
-    trap 'rm -rf "$TMP"' RETURN
+    # 同上: 双引号立即展开路径, 避免 RETURN trap 泄漏到调用方后 $TMP 未绑定
+    trap "rm -rf '$TMP'" RETURN
     if ! download_asset "$VERSION" "$TMP/$ASSET"; then
         echo "!! 下载失败(mirror 与直连均不可用)" >&2
         return 1

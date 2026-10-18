@@ -75,6 +75,23 @@ bash <(curl -fsSL …/install.sh) --uninstall  # 卸载
 > 本 wrapper 已 `export OPENCODE_DISABLE_AUTOUPDATE=1` 关掉官方的自动更新,
 > 并接管了 `update` / `upgrade` 两个子命令,内置完整流程 (查版 → 下载 → patchelf → 验证 → 原子换入)。
 
+## 历史会话在哪
+
+从 V1 升上来后可能以为"历史没了"——**数据没丢,是 V2 的首屏不显示历史列表**
+(V1 首屏会列出上次的 Session / Continue, V2 首屏只有 logo + 输入框)。
+
+会话都存在 `~/.local/share/opencode/opencode.db` (V2 迁移 V1 数据时就地保留):
+
+```bash
+opencode -c                 # 继续上一次会话 (最常用)
+opencode -s <session-id>    # 继续指定会话
+opencode api session.list   # 列出所有会话 id
+opencode --continue         # 同 -c
+```
+
+升级前想保险可以备份: `cp ~/.local/share/opencode/opencode.db ~/opencode.db.bak`
+(我这边的库有 1.4GB, 注意磁盘)。
+
 ## 后台服务
 
 V2 默认会拉起一个**后台服务** (`opencode serve --service`,监听 127.0.0.1 随机端口),

@@ -65,10 +65,26 @@ kernel_needs_proot() {
     return 1
 }
 
-# $1=二进制, 其余=参数: 统一走 proot (-k 5.10.0 + 必要时绑 resolv.conf)
+# Bun 判断内核版本的两个来源都要伪造:
+#   proot -k 5.10.0          只改 uname 系统调用
+#   -b 假 osrelease 文件      改 /proc/sys/kernel/osrelease (proot -k 不管这个!)
+# 只做前者没用 —— Bun 读的是 /proc 那份, 于是仍然走 epoll_pwait2 崩溃。
+fake_osrelease() {
+    local f="$OPENCODE_DIR/.fake-osrelease"
+    mkdir -p "$OPENCODE_DIR" 2>/dev/null || return 0
+    printf '5.10.0\n' >"$f" 2>/dev/null || return 0
+    printf '%s' "$f"
+}
+
+# $1=二进制, 其余=参数: 统一走 proot (-k 5.10.0 + 伪 osrelease + 必要时绑 resolv.conf)
 proot_run() {
     local bin="$1"; shift
     local opts=(-k 5.10.0)
+    local fake
+    fake="$(fake_osrelease)"
+    if [ -n "$fake" ] && [ -f "$fake" ]; then
+        opts+=(-b "$fake:/proc/sys/kernel/osrelease")
+    fi
     if [ -f "${PREFIX}/etc/resolv.conf" ]; then
         opts+=(-b "${PREFIX}/etc/resolv.conf:/etc/resolv.conf")
     fi
@@ -1214,10 +1230,23 @@ kernel_needs_proot() {
     return 1
 }
 
-# $1=二进制, 其余=参数: proot -k 5.10.0 (+ resolv.conf 存在时绑定)
+# 同上: -k 只改 uname, /proc/sys/kernel/osrelease 得靠绑定假文件一起喂
+fake_osrelease() {
+    local f="$BIN_DIR/.fake-osrelease"
+    mkdir -p "$BIN_DIR" 2>/dev/null || return 0
+    printf '5.10.0\n' >"$f" 2>/dev/null || return 0
+    printf '%s' "$f"
+}
+
+# $1=二进制, 其余=参数: proot -k 5.10.0 (+ 伪 osrelease, + resolv.conf 存在时绑定)
 proot_run() {
     local bin="$1"; shift
     local opts=(-k 5.10.0)
+    local fake
+    fake="$(fake_osrelease)"
+    if [ -n "$fake" ] && [ -f "$fake" ]; then
+        opts+=(-b "$fake:/proc/sys/kernel/osrelease")
+    fi
     if [ -f "${PREFIX}/etc/resolv.conf" ]; then
         opts+=(-b "${PREFIX}/etc/resolv.conf:/etc/resolv.conf")
     fi
@@ -1322,10 +1351,16 @@ case "${1:-}" in
         # exec 不能调 bash 函数, 内联 proot 逻辑 (与 run_opencode 同优先级:
         # 内核 >= 5.11 优先走 proot -k 5.10.0, 否则有 root 直跑, 无 root 走 proot)
         if kernel_needs_proot && command -v proot >/dev/null 2>&1; then
+            FAKE_OS="$(fake_osrelease)"
+            OSOPT=()
+            if [ -n "$FAKE_OS" ] && [ -f "$FAKE_OS" ]; then
+                OSOPT=(-b "$FAKE_OS:/proc/sys/kernel/osrelease")
+            fi
             if [ -f "${PREFIX}/etc/resolv.conf" ]; then
-                exec proot -k 5.10.0 -b "${PREFIX}/etc/resolv.conf:/etc/resolv.conf" "$REAL_BIN" "$@"
+                exec proot -k 5.10.0 "${OSOPT[@]}" \
+                    -b "${PREFIX}/etc/resolv.conf:/etc/resolv.conf" "$REAL_BIN" "$@"
             else
-                exec proot -k 5.10.0 "$REAL_BIN" "$@"
+                exec proot -k 5.10.0 "${OSOPT[@]}" "$REAL_BIN" "$@"
             fi
         elif command -v sudo >/dev/null 2>&1 && sudo -n true 2>/dev/null; then
             exec "$REAL_BIN" "$@"

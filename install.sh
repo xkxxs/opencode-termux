@@ -48,6 +48,33 @@ info() { echo -e "${BLU}▸${NC} $*"; }
 warn() { echo -e "${YEL}⚠${NC} $*"; }
 fail() { echo -e "${RED}✗${NC} $*"; exit 1; }
 
+# ---------- proot 兜底 (含 Bun 的 epoll_pwait2 段错误规避) ----------
+# V2 是 Bun 编译的单文件二进制。Bun 在"报告的内核 >= 5.11"时会走
+# epoll_pwait2, 而该 syscall 在部分内核返回 ENOSYS 时 Bun 没有兜底 →
+# 空指针 → SIGSEGV (signal 11, 见 bun#32489)。表现为:
+#   proot info: vpid 1: terminated with signal 11
+# 解法: 用 proot -k 5.10.0 把进程看到的内核版本降到 5.10, Bun 就会退回
+# epoll_pwait。副作用只是 proot 内 uname 显示 5.10。
+kernel_needs_proot() {
+    local maj min
+    maj="$(uname -r | cut -d. -f1 | tr -dc '0-9')"
+    min="$(uname -r | cut -d. -f2 | tr -dc '0-9')"
+    [ -z "$maj" ] && return 1
+    [ "$maj" -gt 5 ] && return 0
+    if [ "$maj" -eq 5 ] && [ -n "$min" ] && [ "$min" -ge 11 ]; then return 0; fi
+    return 1
+}
+
+# $1=二进制, 其余=参数: 统一走 proot (-k 5.10.0 + 必要时绑 resolv.conf)
+proot_run() {
+    local bin="$1"; shift
+    local opts=(-k 5.10.0)
+    if [ -f "${PREFIX}/etc/resolv.conf" ]; then
+        opts+=(-b "${PREFIX}/etc/resolv.conf:/etc/resolv.conf")
+    fi
+    proot "${opts[@]}" env -u LD_PRELOAD "SSL_CERT_FILE=${SSL_CERT_FILE:-$PREFIX/etc/tls/cert.pem}" "$bin" "$@"
+}
+
 # ---------- 下载 ----------
 # 官方 API 形如 {"channel":"latest",...,"version":"2.0.32",...}
 oc_latest_version() {
@@ -1043,21 +1070,18 @@ install_opencode() {
     # 全部失败时把真实输出打出来, 否则只剩一句"验证失败"没法排查。
     local verify_log="$work/verify.log"
     local verify_ok=0
-    env -u LD_PRELOAD "SSL_CERT_FILE=${SSL_CERT_FILE:-$PREFIX/etc/tls/cert.pem}" \
-        "$new_bin" --version >"$verify_log" 2>&1 && verify_ok=1
+    # 内核 >= 5.11 时连原生直跑都会段错误 (Bun epoll_pwait2), 直接用 proot -k 5.10.0
+    if kernel_needs_proot; then
+        info "内核 $(uname -r) >= 5.11: 用 proot -k 5.10.0 规避 Bun 的 epoll_pwait2 崩溃"
+    else
+        env -u LD_PRELOAD "SSL_CERT_FILE=${SSL_CERT_FILE:-$PREFIX/etc/tls/cert.pem}" \
+            "$new_bin" --version >"$verify_log" 2>&1 && verify_ok=1
+    fi
     if [ "$verify_ok" -eq 0 ] && command -v proot >/dev/null 2>&1; then
-        if [ -f "${PREFIX}/etc/resolv.conf" ]; then
-            proot -b "${PREFIX}/etc/resolv.conf:/etc/resolv.conf" \
-                env -u LD_PRELOAD "SSL_CERT_FILE=${SSL_CERT_FILE:-$PREFIX/etc/tls/cert.pem}" \
-                "$new_bin" --version >"$verify_log" 2>&1 && verify_ok=1
-        fi
-        if [ "$verify_ok" -eq 0 ]; then
-            proot env -u LD_PRELOAD "SSL_CERT_FILE=${SSL_CERT_FILE:-$PREFIX/etc/tls/cert.pem}" \
-                "$new_bin" --version >"$verify_log" 2>&1 && verify_ok=1
-        fi
+        proot_run "$new_bin" --version >"$verify_log" 2>&1 && verify_ok=1
     fi
     if [ "$verify_ok" -ne 1 ]; then
-        warn "新二进制无法运行 (proot 存在: $(command -v proot >/dev/null 2>&1 && echo 是 || echo 否)), 最后一次尝试的输出:"
+        warn "新二进制无法运行 (proot: $(command -v proot >/dev/null 2>&1 && echo 有 || echo 无), 内核: $(uname -r)), 最后一次尝试的输出:"
         sed 's/^/    /' "$verify_log" 2>/dev/null | head -20
         [ -f "${PREFIX}/etc/resolv.conf" ] || warn "缺少 ${PREFIX}/etc/resolv.conf (dns-bootstrap 未成功写入?)"
         fail "新二进制验证失败 (无 root 请确保已安装 proot), 已放弃替换"
@@ -1157,22 +1181,47 @@ download_asset() {
     return 1
 }
 
-# 运行 opencode 二进制: 有 root 直跑, 无 root 走 proot (避免 seccomp 拦截 musl 系统调用)
+# 运行 opencode 二进制。优先级:
+#   1) 内核 >= 5.11 → 必须 proot -k 5.10.0 (Bun epoll_pwait2 会段错误,
+#      这条优先于 root —— 即使有 root, 原生直跑同样会崩)
+#   2) 有 root → 原生直跑
+#   3) 无 root → proot (seccomp 会拦 musl 的系统调用)
 run_opencode() {
     local bin="$1"; shift
     local _env="env -u LD_PRELOAD SSL_CERT_FILE=${SSL_CERT_FILE:-$PREFIX/etc/tls/cert.pem}"
-    if command -v sudo >/dev/null 2>&1 && sudo -n true 2>/dev/null; then
+    if kernel_needs_proot && command -v proot >/dev/null 2>&1; then
+        proot_run "$bin" "$@"
+    elif command -v sudo >/dev/null 2>&1 && sudo -n true 2>/dev/null; then
         $_env "$bin" "$@"
     elif command -v proot >/dev/null 2>&1; then
-        # resolv.conf 不存在时 proot -b 会直接失败, 降级为不绑定
-        if [ -f "${PREFIX}/etc/resolv.conf" ]; then
-            proot -b "${PREFIX}/etc/resolv.conf:/etc/resolv.conf" $_env "$bin" "$@"
-        else
-            proot $_env "$bin" "$@"
-        fi
+        proot_run "$bin" "$@"
     else
         $_env "$bin" "$@"
     fi
+}
+
+# Bun 编译的二进制在"报告的内核 >= 5.11"时走 epoll_pwait2, 该 syscall 返回
+# ENOSYS 时 Bun 无兜底 → 空指针段错误 (bun#32489), 现象:
+#   proot info: vpid 1: terminated with signal 11
+# 规避: proot -k 5.10.0 把看到的内核降到 5.10 → Bun 退回 epoll_pwait。
+kernel_needs_proot() {
+    local maj min
+    maj="$(uname -r | cut -d. -f1 | tr -dc '0-9')"
+    min="$(uname -r | cut -d. -f2 | tr -dc '0-9')"
+    [ -z "$maj" ] && return 1
+    [ "$maj" -gt 5 ] && return 0
+    if [ "$maj" -eq 5 ] && [ -n "$min" ] && [ "$min" -ge 11 ]; then return 0; fi
+    return 1
+}
+
+# $1=二进制, 其余=参数: proot -k 5.10.0 (+ resolv.conf 存在时绑定)
+proot_run() {
+    local bin="$1"; shift
+    local opts=(-k 5.10.0)
+    if [ -f "${PREFIX}/etc/resolv.conf" ]; then
+        opts+=(-b "${PREFIX}/etc/resolv.conf:/etc/resolv.conf")
+    fi
+    proot "${opts[@]}" env -u LD_PRELOAD "SSL_CERT_FILE=${SSL_CERT_FILE:-$PREFIX/etc/tls/cert.pem}" "$bin" "$@"
 }
 
 # 本地已记录版本; 无记录时从二进制本身探测 (可能为空)
@@ -1270,11 +1319,17 @@ case "${1:-}" in
            && ! printf '%s\n' "$@" | grep -qx -- '--standalone'; then
             set -- --standalone "$@"
         fi
-        # exec 不能调 bash 函数, 内联 proot 逻辑
-        if command -v sudo >/dev/null 2>&1 && sudo -n true 2>/dev/null; then
+        # exec 不能调 bash 函数, 内联 proot 逻辑 (与 run_opencode 同优先级:
+        # 内核 >= 5.11 优先走 proot -k 5.10.0, 否则有 root 直跑, 无 root 走 proot)
+        if kernel_needs_proot && command -v proot >/dev/null 2>&1; then
+            if [ -f "${PREFIX}/etc/resolv.conf" ]; then
+                exec proot -k 5.10.0 -b "${PREFIX}/etc/resolv.conf:/etc/resolv.conf" "$REAL_BIN" "$@"
+            else
+                exec proot -k 5.10.0 "$REAL_BIN" "$@"
+            fi
+        elif command -v sudo >/dev/null 2>&1 && sudo -n true 2>/dev/null; then
             exec "$REAL_BIN" "$@"
         elif command -v proot >/dev/null 2>&1; then
-            # resolv.conf 不存在时 proot -b 会直接失败, 降级为不绑定
             if [ -f "${PREFIX}/etc/resolv.conf" ]; then
                 exec proot -b "${PREFIX}/etc/resolv.conf:/etc/resolv.conf" "$REAL_BIN" "$@"
             else

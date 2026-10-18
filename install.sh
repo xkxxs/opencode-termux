@@ -202,7 +202,14 @@ install_dependencies() {
         ok "依赖已就绪 (patchelf $(patchelf --version 2>/dev/null | grep -oE '[0-9.]+'), node $(node --version))"
     fi
     if ! sudo -n true 2>/dev/null; then
-        command -v proot >/dev/null 2>&1 || { info "未检测到 root, 安装 proot 兜底…"; pkg install -y proot; }
+        if ! command -v proot >/dev/null 2>&1; then
+            info "未检测到 root, 安装 proot 兜底…"
+            pkg install -y proot || true
+        fi
+        # 无 root 时 musl 二进制会被 seccomp 拦截 (Bad system call / Segmentation fault),
+        # 没有 proot 就跑不起来 → 在这里早失败, 别等到验证阶段才段错误。
+        command -v proot >/dev/null 2>&1 \
+            || fail "无 root 环境必须用 proot 才能运行 musl 二进制, 但 proot 安装失败。请手动: pkg install proot"
         warn "未检测到 root: 将使用 proot 兜底方案 (性能略降)"
     fi
 }
@@ -1027,19 +1034,33 @@ install_opencode() {
     info "patchelf: rpath → $RPATH"
     patchelf --set-rpath "$RPATH" "$new_bin" || fail "patchelf rpath 失败"
 
-    # 验证能跑才替换
-    # 无 root 时 musl 二进制被 Android seccomp 拦截 → Bad system call, 需走 proot
-    local verify_env="env -u LD_PRELOAD SSL_CERT_FILE=${SSL_CERT_FILE:-$PREFIX/etc/tls/cert.pem}"
+    # 验证能跑才替换。
+    # 无 root 时 musl 二进制会被 Android seccomp 拦截 (Bad system call /
+    # Segmentation fault), 必须走 proot。按顺序尝试:
+    #   1) 原生直跑 (有 root / 内核允许时可用)
+    #   2) proot + 绑定 resolv.conf (仅当该文件存在 —— 不存在时 proot -b 会直接失败)
+    #   3) proot 不绑定 (降级)
+    # 全部失败时把真实输出打出来, 否则只剩一句"验证失败"没法排查。
+    local verify_log="$work/verify.log"
     local verify_ok=0
-    if command -v proot >/dev/null 2>&1; then
-        proot -b "${PREFIX}/etc/resolv.conf:/etc/resolv.conf" \
-            $verify_env "$new_bin" --version >/dev/null 2>&1 && verify_ok=1
-    fi
-    if [ "$verify_ok" -eq 0 ]; then
-        $verify_env "$new_bin" --version >/dev/null 2>&1 && verify_ok=1
+    env -u LD_PRELOAD "SSL_CERT_FILE=${SSL_CERT_FILE:-$PREFIX/etc/tls/cert.pem}" \
+        "$new_bin" --version >"$verify_log" 2>&1 && verify_ok=1
+    if [ "$verify_ok" -eq 0 ] && command -v proot >/dev/null 2>&1; then
+        if [ -f "${PREFIX}/etc/resolv.conf" ]; then
+            proot -b "${PREFIX}/etc/resolv.conf:/etc/resolv.conf" \
+                env -u LD_PRELOAD "SSL_CERT_FILE=${SSL_CERT_FILE:-$PREFIX/etc/tls/cert.pem}" \
+                "$new_bin" --version >"$verify_log" 2>&1 && verify_ok=1
+        fi
+        if [ "$verify_ok" -eq 0 ]; then
+            proot env -u LD_PRELOAD "SSL_CERT_FILE=${SSL_CERT_FILE:-$PREFIX/etc/tls/cert.pem}" \
+                "$new_bin" --version >"$verify_log" 2>&1 && verify_ok=1
+        fi
     fi
     if [ "$verify_ok" -ne 1 ]; then
-        fail "新二进制验证失败 (如无 root 请确保已安装 proot), 已放弃替换"
+        warn "新二进制无法运行 (proot 存在: $(command -v proot >/dev/null 2>&1 && echo 是 || echo 否)), 最后一次尝试的输出:"
+        sed 's/^/    /' "$verify_log" 2>/dev/null | head -20
+        [ -f "${PREFIX}/etc/resolv.conf" ] || warn "缺少 ${PREFIX}/etc/resolv.conf (dns-bootstrap 未成功写入?)"
+        fail "新二进制验证失败 (无 root 请确保已安装 proot), 已放弃替换"
     fi
 
     mkdir -p "$OPENCODE_DIR"
@@ -1143,7 +1164,12 @@ run_opencode() {
     if command -v sudo >/dev/null 2>&1 && sudo -n true 2>/dev/null; then
         $_env "$bin" "$@"
     elif command -v proot >/dev/null 2>&1; then
-        proot -b "${PREFIX}/etc/resolv.conf:/etc/resolv.conf" $_env "$bin" "$@"
+        # resolv.conf 不存在时 proot -b 会直接失败, 降级为不绑定
+        if [ -f "${PREFIX}/etc/resolv.conf" ]; then
+            proot -b "${PREFIX}/etc/resolv.conf:/etc/resolv.conf" $_env "$bin" "$@"
+        else
+            proot $_env "$bin" "$@"
+        fi
     else
         $_env "$bin" "$@"
     fi
@@ -1248,7 +1274,12 @@ case "${1:-}" in
         if command -v sudo >/dev/null 2>&1 && sudo -n true 2>/dev/null; then
             exec "$REAL_BIN" "$@"
         elif command -v proot >/dev/null 2>&1; then
-            exec proot -b "${PREFIX}/etc/resolv.conf:/etc/resolv.conf" "$REAL_BIN" "$@"
+            # resolv.conf 不存在时 proot -b 会直接失败, 降级为不绑定
+            if [ -f "${PREFIX}/etc/resolv.conf" ]; then
+                exec proot -b "${PREFIX}/etc/resolv.conf:/etc/resolv.conf" "$REAL_BIN" "$@"
+            else
+                exec proot "$REAL_BIN" "$@"
+            fi
         else
             exec "$REAL_BIN" "$@"
         fi

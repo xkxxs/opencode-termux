@@ -1,14 +1,18 @@
 #!/data/data/com.termux/files/usr/bin/bash
 # ============================================================
-# opencode-termux — 在 Termux (Android aarch64) 上一键安装官方 OpenCode CLI
+# opencode-termux — 在 Termux (Android aarch64) 上一键安装官方 OpenCode CLI V2
 # 方案: 官方 musl 动态链接版 + patchelf 改 interpreter/rpath
 #
 # 用法:
 #   bash <(curl -fsSL https://raw.githubusercontent.com/xkxxs/opencode-termux/main/install.sh)
 #   bash <(curl -fsSL …/install.sh) --uninstall
 #
+# V1 vs V2:
+#   V1 走 GitHub Releases, V2 起官方改用 npm 分发 —— 本仓库跟随 V2;
+#   V1 版本已归档到 xkxxs/OpenCodeV1-Termux (冻结)。
+#
 # 原理:
-#   官方 opencode-linux-arm64-musl.tar.gz 是动态链接 musl (非静态!),
+#   官方 @opencode/cli-linux-arm64-musl 是动态链接 musl (非静态!),
 #   Android 没有 musl 运行环境, 需从 Alpine 获取 ld-musl-aarch64.so.1
 #   + libstdc++.so.6 + libgcc_s.so.1, 再用 patchelf 改二进制:
 #     interpreter → /usr/lib/ld-musl-aarch64.so.1
@@ -30,8 +34,12 @@ WRAPPER_PATH="$HOME_DIR/.local/bin/opencode"
 INTERP="$PREFIX/lib/ld-musl-aarch64.so.1"
 RPATH="$PREFIX/lib/musl"
 CERT_FILE="$PREFIX/etc/tls/cert.pem"
-REPO="sst/opencode"
-ASSET="opencode-linux-arm64-musl.tar.gz"
+# V2 起官方改用 npm 分发, 不再走 GitHub Releases (V1 仍在 GitHub 发版,
+# 已归档到 xkxxs/OpenCodeV1-Termux)。musl ARM64 平台包:
+NPM_PKG="@opencode/cli-linux-arm64-musl"
+# 注意: 官方 install 脚本判定 musl 靠 /etc/alpine-release 或 ldd|grep musl,
+# Termux 两个都不满足 → 它会误选 glibc 包。这里直接写死 musl 变体。
+UPDATE_API="https://opencode.ai/update/api/latest/cli/npm"
 
 # ---------- 颜色 ----------
 RED='\033[0;31m'; GRN='\033[0;32m'; YEL='\033[1;33m'; BLU='\033[1;36m'; NC='\033[0m'
@@ -39,6 +47,47 @@ ok()   { echo -e "${GRN}✓${NC} $*"; }
 info() { echo -e "${BLU}▸${NC} $*"; }
 warn() { echo -e "${YEL}⚠${NC} $*"; }
 fail() { echo -e "${RED}✗${NC} $*"; exit 1; }
+
+# ---------- 下载 ----------
+# 官方 API 形如 {"channel":"latest",...,"version":"2.0.32",...}
+oc_latest_version() {
+    local v=""
+    v="$(curl -fsSL --max-time 20 "$UPDATE_API" 2>/dev/null \
+        | sed -n 's/.*"version":"\([^"]*\)".*/\1/p' | head -1)" || v=""
+    if [ -z "$v" ]; then
+        v="$(npm view @opencode/cli version 2>/dev/null | tail -1)" || v=""
+    fi
+    printf '%s' "$v"
+}
+
+# $1=版本 → 输出两个候选直连 URL (npm view 不可用时的兜底)
+fallback_tarball_urls() {
+    local name="${NPM_PKG##*/}" scope="${NPM_PKG%/*}"
+    printf 'https://registry.npmmirror.com/%s/%s/-/%s-%s.tgz\n' "$scope" "$name" "$name" "$1"
+    printf 'https://registry.npmjs.org/%s/%s/-/%s-%s.tgz\n' "$scope" "$name" "$name" "$1"
+}
+
+# $1=版本 $2=输出文件: 带进度条下载, 失败自动换镜像
+download_tgz() {
+    local ver="$1" out="$2" url="" alt="" u
+    url="$(npm view "$NPM_PKG@$ver" dist.tarball 2>/dev/null | tail -1)" || url=""
+    if [ -n "$url" ]; then
+        curl -fSL --progress-bar --connect-timeout 15 --max-time 900 "$url" -o "$out" && return 0
+        case "$url" in
+            *registry.npmjs.org*)     alt="${url/registry.npmjs.org/registry.npmmirror.com}" ;;
+            *registry.npmmirror.com*) alt="${url/registry.npmmirror.com/registry.npmjs.org}" ;;
+        esac
+        if [ -n "$alt" ] && [ "$alt" != "$url" ]; then
+            warn "直连失败, 换镜像重试…"
+            curl -fSL --progress-bar --connect-timeout 15 --max-time 900 "$alt" -o "$out" && return 0
+        fi
+    fi
+    warn "取不到 tarball URL, 改用固定 URL 规则直连…"
+    while read -r u; do
+        curl -fSL --progress-bar --connect-timeout 15 --max-time 900 "$u" -o "$out" && return 0
+    done < <(fallback_tarball_urls "$ver")
+    return 1
+}
 
 # ---------- 环境检查 ----------
 check_environment() {
@@ -861,14 +910,9 @@ CHECK_EOF
 
 # ---------- 安装官方 OpenCode ----------
 install_opencode() {
-    info "查询最新版本 (GitHub API, mirror 优先)…"
+    info "查询最新版本 (opencode.ai API, npm 兜底)…"
     local version=""
-    version=$(curl -fsSL --max-time 20 "https://gh-proxy.com/https://api.github.com/repos/$REPO/releases/latest" 2>/dev/null \
-        | grep -oE '"tag_name": *"v[^"]+"' | head -n1 | cut -d'"' -f4) || true
-    if [ -z "$version" ]; then
-        version=$(curl -fsSL --max-time 15 "https://api.github.com/repos/$REPO/releases/latest" 2>/dev/null \
-            | grep -oE '"tag_name": *"v[^"]+"' | head -n1 | cut -d'"' -f4) || true
-    fi
+    version=$(oc_latest_version) || true
     [ -n "$version" ] || fail "无法获取最新版本 (网络问题?)"
     info "最新版本: $version"
 
@@ -885,21 +929,13 @@ install_opencode() {
     # 单引号版本会在函数返回时才求值, 而 RETURN trap 会泄漏到调用方
     # (调用方返回时再次触发), 那时 $work 已出作用域 → set -u 报 unbound variable。
     trap "rm -rf '$work'" RETURN
-    info "下载 $ASSET ($version, 约 50MB)…"
-    local dl=0
-    for url in \
-        "https://gh-proxy.com/https://github.com/$REPO/releases/download/$version/$ASSET" \
-        "https://github.com/$REPO/releases/download/$version/$ASSET"; do
-        # 不用 -s: 保留 curl 的进度条
-        if curl -fSL --progress-bar --connect-timeout 15 --max-time 600 "$url" -o "$work/$ASSET"; then
-            dl=1; break
-        fi
-    done
-    [ "$dl" = 1 ] || fail "下载失败 (mirror 与直连均不可用)"
+    info "下载 $NPM_PKG v$version (约 96MB 包 / 206MB 二进制)…"
+    download_tgz "$version" "$work/cli.tgz" || fail "下载失败 (npm 与各镜像均不可用)"
 
-    tar xzf "$work/$ASSET" -C "$work" || fail "解压失败"
-    local new_bin="$work/opencode"
-    [ -f "$new_bin" ] || fail "tarball 内未找到 opencode 二进制"
+    tar xzf "$work/cli.tgz" -C "$work" || fail "解压失败"
+    # V2 的 tarball 内路径是 package/bin/opencode
+    local new_bin="$work/package/bin/opencode"
+    [ -f "$new_bin" ] || fail "tarball 内未找到 package/bin/opencode"
     chmod +x "$new_bin"
 
     info "patchelf: interpreter → $INTERP"
@@ -935,19 +971,20 @@ write_wrapper() {
     cat > "$WRAPPER_PATH" << 'WRAPPER_EOF'
 #!/data/data/com.termux/files/usr/bin/bash
 # ============================================================
-# opencode wrapper for Termux
+# opencode wrapper for Termux (OpenCode V2)
 # ~/.local/bin/opencode
 #
-# Official OpenCode (sst/opencode) musl build, patched:
+# Official OpenCode V2 musl build (npm: @opencode/cli-linux-arm64-musl), patched:
 #   interpreter → Termux musl loader (ld-musl-aarch64.so.1)
 #   rpath       → Termux musl libs (libstdc++, libgcc_s)
 #
 # Usage:
 #   opencode [args...]          run opencode (patched); 启动前自动
 #                               检查最新版本, 非最新则自动更新再启动
-#   opencode update [--force]   re-download latest musl build,
-#                               re-patch, atomically swap binary
-#   opencode upgrade            alias of update
+#   opencode update [--force]   重新下载官方包 → patchelf → 验证 → 原子换入
+#   opencode upgrade            同 update (这两个子命令由本 wrapper 接管,
+#                               否则官方会用它自己的二进制覆盖我们打过补丁
+#                               的那份, 导致再次无法运行)
 #
 # Env:
 #   OPENCODE_NO_AUTO_UPDATE=1   skip auto-update check on startup
@@ -961,40 +998,57 @@ REAL_BIN="$BIN_DIR/opencode"
 VERSION_FILE="$BIN_DIR/.version"
 INTERP="$PREFIX/lib/ld-musl-aarch64.so.1"
 RPATH="$PREFIX/lib/musl"
-REPO="sst/opencode"
-ASSET="opencode-linux-arm64-musl.tar.gz"
+# V2 起官方走 npm 分发 (不再是 GitHub Releases)
+NPM_PKG="@opencode/cli-linux-arm64-musl"
+UPDATE_API="https://opencode.ai/update/api/latest/cli/npm"
 
 export SSL_CERT_FILE="${SSL_CERT_FILE:-$PREFIX/etc/tls/cert.pem}"
+# V2 自带自动更新: 它会下载官方原始二进制直接替换, 而那份没有经过
+# patchelf (interpreter 还是 /lib/ld-musl-aarch64.so.1) → 在 Termux 上又跑不起来。
+# 所以关掉官方的, 统一由本 wrapper 接管: opencode update
+export OPENCODE_DISABLE_AUTOUPDATE=1
 
 # termux-exec's LD_PRELOAD hook lib is Bionic-compiled; the musl
 # dynamic linker can't relocate it. opencode doesn't need it.
 unset LD_PRELOAD
 
-# Get latest tag (vX.Y.Z): gh-proxy mirror first (国内可用), 直连兜底。
-# 参数: $1 = mirror 超时(默认20) $2 = 直连超时(默认15)
+# 官方 API: {"channel":"latest",...,"version":"2.0.32",...}; 失败再用 npm view。
+# 参数: $1 = API 超时(默认20)
 latest_version() {
-    local mirror_timeout="${1:-20}" direct_timeout="${2:-15}"
-    local api="https://api.github.com/repos/$REPO/releases/latest"
-    local v=""
-    v="$(curl -fsSL --max-time "$mirror_timeout" "https://gh-proxy.com/$api" 2>/dev/null \
-        | grep -oE '"tag_name": *"v[^"]+"' | head -n1 | cut -d'"' -f4)" || true
+    local timeout="${1:-20}" v=""
+    v="$(curl -fsSL --max-time "$timeout" "$UPDATE_API" 2>/dev/null \
+        | sed -n 's/.*"version":"\([^"]*\)".*/\1/p' | head -1)" || v=""
     if [ -z "$v" ]; then
-        v="$(curl -fsSL --max-time "$direct_timeout" "$api" 2>/dev/null \
-            | grep -oE '"tag_name": *"v[^"]+"' | head -n1 | cut -d'"' -f4)" || true
+        v="$(npm view @opencode/cli version --fetch-timeout=10000 --fetch-retries=0 2>/dev/null | tail -1)" || v=""
     fi
     printf '%s' "$v"
 }
 
-# Download release asset: gh-proxy mirror first, GitHub direct as fallback.
+# $1=版本 → 两个候选直连 URL (npm view 不可用时的兜底)
+fallback_tarball_urls() {
+    local name="${NPM_PKG##*/}" scope="${NPM_PKG%/*}"
+    printf 'https://registry.npmmirror.com/%s/%s/-/%s-%s.tgz\n' "$scope" "$name" "$name" "$1"
+    printf 'https://registry.npmjs.org/%s/%s/-/%s-%s.tgz\n' "$scope" "$name" "$name" "$1"
+}
+
+# $1=版本 $2=输出文件: 带进度条下载, 失败自动换镜像
 download_asset() {
-    local ver="$1" out="$2"
-    for url in \
-        "https://gh-proxy.com/https://github.com/$REPO/releases/download/$ver/$ASSET" \
-        "https://github.com/$REPO/releases/download/$ver/$ASSET"; do
-        if curl -fSL --progress-bar --connect-timeout 15 --max-time 600 "$url" -o "$out"; then
-            return 0
+    local ver="$1" out="$2" url="" alt="" u
+    url="$(npm view "$NPM_PKG@$ver" dist.tarball 2>/dev/null | tail -1)" || url=""
+    if [ -n "$url" ]; then
+        curl -fSL --progress-bar --connect-timeout 15 --max-time 900 "$url" -o "$out" && return 0
+        case "$url" in
+            *registry.npmjs.org*)     alt="${url/registry.npmjs.org/registry.npmmirror.com}" ;;
+            *registry.npmmirror.com*) alt="${url/registry.npmmirror.com/registry.npmjs.org}" ;;
+        esac
+        if [ -n "$alt" ] && [ "$alt" != "$url" ]; then
+            echo "!! 直连失败, 换镜像重试…" >&2
+            curl -fSL --progress-bar --connect-timeout 15 --max-time 900 "$alt" -o "$out" && return 0
         fi
-    done
+    fi
+    while read -r u; do
+        curl -fSL --progress-bar --connect-timeout 15 --max-time 900 "$u" -o "$out" && return 0
+    done < <(fallback_tarball_urls "$ver")
     return 1
 }
 
@@ -1030,21 +1084,23 @@ version_ge() {
 # 下载 → 解压 → patchelf → 验证 → 原子换入。失败返回 1 (保留旧二进制)。
 do_update() {
     local VERSION="$1"
-    echo "==> 下载 $ASSET ($VERSION, 约 50MB, 可能较慢) …"
+    echo "==> 下载 $NPM_PKG v$VERSION (约 96MB 包 / 206MB 二进制) …"
     local TMP
     TMP="$(mktemp -d "${TMPDIR:-$HOME}/.opencode-update.XXXXXX")" || return 1
     # 同上: 双引号立即展开路径, 避免 RETURN trap 泄漏到调用方后 $TMP 未绑定
     trap "rm -rf '$TMP'" RETURN
-    if ! download_asset "$VERSION" "$TMP/$ASSET"; then
-        echo "!! 下载失败(mirror 与直连均不可用)" >&2
+    if ! download_asset "$VERSION" "$TMP/cli.tgz"; then
+        echo "!! 下载失败(npm 与各镜像均不可用)" >&2
         return 1
     fi
 
-    if ! tar xzf "$TMP/$ASSET" -C "$TMP"; then
+    if ! tar xzf "$TMP/cli.tgz" -C "$TMP"; then
         echo "!! 解压失败" >&2
         return 1
     fi
-    local NEW_BIN="$TMP/opencode"
+    # V2 的 tarball 内路径是 package/bin/opencode
+    local NEW_BIN="$TMP/package/bin/opencode"
+    [ -f "$NEW_BIN" ] || { echo "!! tarball 内未找到 package/bin/opencode" >&2; return 1; }
     chmod +x "$NEW_BIN"
     echo "==> patchelf: interpreter + rpath …"
     patchelf --set-interpreter "$INTERP" "$NEW_BIN" || return 1
@@ -1097,6 +1153,12 @@ case "${1:-}" in
                     fi
                 fi
             fi
+        fi
+        # 不想留常驻后台服务时: OPENCODE_STANDALONE=1 自动附加 --standalone
+        # (进程内私有服务, 用完就退)。用户自己传过则不重复加。
+        if [ "${OPENCODE_STANDALONE:-0}" = "1" ] \
+           && ! printf '%s\n' "$@" | grep -qx -- '--standalone'; then
+            set -- --standalone "$@"
         fi
         # exec 不能调 bash 函数, 内联 proot 逻辑
         if command -v sudo >/dev/null 2>&1 && sudo -n true 2>/dev/null; then

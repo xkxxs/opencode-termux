@@ -1423,14 +1423,31 @@ case "${1:-}" in
                 fi
             fi
         fi
-        # 不想留常驻后台服务时: OPENCODE_STANDALONE=1 自动附加 --standalone
-        # (进程内私有服务, 用完就退)。用户自己传过则不重复加。
-        if [ "${OPENCODE_STANDALONE:-0}" = "1" ] \
-           && ! printf '%s\n' "$@" | grep -qx -- '--standalone'; then
-            set -- --standalone "$@"
-        fi
         # exec 不能调 bash 函数, 内联逻辑
         RUN_MODE="$(cat "$MODE_FILE" 2>/dev/null || echo native)"
+        # --standalone: 进程内私有服务, 用完就退, 不连常驻后台服务。
+        #   OPENCODE_STANDALONE=1 → 强制 standalone
+        #   OPENCODE_STANDALONE=0 → 强制后台服务
+        #   未设置 → proot-bind 模式默认 standalone, native 模式用官方默认
+        #
+        # 为什么 proot-bind 要默认 standalone: 该模式下后台服务
+        # (opencode serve --service) 起来后客户端能拿到结果, 但进程**不退出**
+        # —— 表现为 TUI 里输入 /exit 或按 Ctrl+C 后一直停在
+        # "Starting background server…", 只能杀进程。standalone 无此问题。
+        if [ "${OPENCODE_STANDALONE:-unset}" = "unset" ] && [ "$RUN_MODE" = "proot-bind" ]; then
+            OPENCODE_STANDALONE=1
+        fi
+        # 注意: 部分子命令不接受 --standalone (如 `opencode api GET ...` 会报
+        # "Unrecognized flag"), 所以只在没有子命令时附加
+        case "${1:-}" in
+            api|serve|update|upgrade|auth|models|session|export|import|install|uninstall|acp|mcp|plugin|stats|web|github) : ;;
+            *)
+                if [ "${OPENCODE_STANDALONE:-0}" = "1" ] \
+                   && ! printf '%s\n' "$@" | grep -qx -- '--standalone'; then
+                    set -- --standalone "$@"
+                fi
+                ;;
+        esac
         if [ "$RUN_MODE" = "proot-bind" ] && command -v proot >/dev/null 2>&1; then
             # 未打补丁的官方二进制: 靠 proot 把运行库绑到标准路径
             OSOPT=()

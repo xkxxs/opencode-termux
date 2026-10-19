@@ -104,6 +104,26 @@ app-server daemon 那样卡死),TUI 也正常。
 opencode --standalone        # 或 OPENCODE_STANDALONE=1 由 wrapper 自动附加
 ```
 
+### proot-bind 模式下默认走 standalone
+
+如果安装时因为 patchelf 把二进制改坏而落到了 **proot-bind** 模式
+(`cat ~/.local/opencode/.mode`),wrapper 会**自动附加 `--standalone`**。原因:
+
+该模式下后台服务虽然能起来、也能正常返回结果,但**客户端干完活不退出** ——
+表现为 TUI 里 `/exit` 或 Ctrl+C 之后一直停在 "Starting background server…",
+只能杀进程。实测对比 (真 pty,发 Ctrl+C 计时):
+
+| 模式 | Ctrl+C 之后 |
+|---|---|
+| `--standalone` | **0.6 秒干净退出** |
+| 后台服务 | 29 秒仍未退出,只能强杀 |
+
+代价:每次启动重新起一次进程内服务,不能跨终端共享同一个会话实例。
+想强行用后台服务:`OPENCODE_STANDALONE=0 opencode`。
+
+> `native` 模式 (patchelf 正常时) 仍用官方默认的后台服务。若你遇到同样的
+> 退出卡住,加 `OPENCODE_STANDALONE=1` 即可。
+
 ## 配置模型 (DeepSeek 等)
 
 OpenCode 支持 Anthropic 兼容端点:

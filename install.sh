@@ -30,6 +30,7 @@ HOME_DIR="${HOME:-/data/data/com.termux/files/home}"
 OPENCODE_DIR="$HOME_DIR/.local/opencode"
 REAL_BIN="$OPENCODE_DIR/opencode"
 VERSION_FILE="$OPENCODE_DIR/.version"
+MODE_FILE="$OPENCODE_DIR/.mode"   # native (patchelf) / proot-bind
 WRAPPER_PATH="$HOME_DIR/.local/bin/opencode"
 INTERP="$PREFIX/lib/ld-musl-aarch64.so.1"
 RPATH="$PREFIX/lib/musl"
@@ -84,6 +85,32 @@ proot_run() {
     fake="$(fake_osrelease)"
     if [ -n "$fake" ] && [ -f "$fake" ]; then
         opts+=(-b "$fake:/proc/sys/kernel/osrelease")
+    fi
+    if [ -f "${PREFIX}/etc/resolv.conf" ]; then
+        opts+=(-b "${PREFIX}/etc/resolv.conf:/etc/resolv.conf")
+    fi
+    proot "${opts[@]}" env -u LD_PRELOAD "SSL_CERT_FILE=${SSL_CERT_FILE:-$PREFIX/etc/tls/cert.pem}" "$bin" "$@"
+}
+
+# 不用 patchelf 的备选方案: 二进制保持原样, 由 proot 把 musl 运行库绑定
+# 到二进制原本要找的标准路径上。用来绕开 patchelf 0.19.2 把大二进制改坏
+# 的问题 (见 install_opencode 里的说明)。
+proot_bind_run() {
+    local bin="$1"; shift
+    local opts=() fake=""
+    if kernel_needs_proot; then
+        opts+=(-k 5.10.0)
+        fake="$(fake_osrelease)"
+        if [ -n "$fake" ] && [ -f "$fake" ]; then
+            opts+=(-b "$fake:/proc/sys/kernel/osrelease")
+        fi
+    fi
+    opts+=(-b "${INTERP}:/lib/ld-musl-aarch64.so.1")
+    if [ -f "${RPATH}/libstdc++.so.6" ]; then
+        opts+=(-b "${RPATH}/libstdc++.so.6:/usr/lib/libstdc++.so.6")
+    fi
+    if [ -f "${RPATH}/libgcc_s.so.1" ]; then
+        opts+=(-b "${RPATH}/libgcc_s.so.1:/usr/lib/libgcc_s.so.1")
     fi
     if [ -f "${PREFIX}/etc/resolv.conf" ]; then
         opts+=(-b "${PREFIX}/etc/resolv.conf:/etc/resolv.conf")
@@ -1086,42 +1113,56 @@ install_opencode() {
     [ -f "$new_bin" ] || fail "tarball 内未找到 package/bin/opencode"
     chmod +x "$new_bin"
 
-    info "patchelf: interpreter → $INTERP"
-    patchelf --set-interpreter "$INTERP" "$new_bin" || fail "patchelf interpreter 失败"
-    info "patchelf: rpath → $RPATH"
-    patchelf --set-rpath "$RPATH" "$new_bin" || fail "patchelf rpath 失败"
+    # 留一份未打补丁的原始二进制 (patchelf 失败时用它)
+    cp "$new_bin" "$work/opencode.orig"
 
-    # 验证能跑才替换。
-    # 无 root 时 musl 二进制会被 Android seccomp 拦截 (Bad system call /
-    # Segmentation fault), 必须走 proot。按顺序尝试:
-    #   1) 原生直跑 (有 root / 内核允许时可用)
-    #   2) proot + 绑定 resolv.conf (仅当该文件存在 —— 不存在时 proot -b 会直接失败)
-    #   3) proot 不绑定 (降级)
-    # 全部失败时把真实输出打出来, 否则只剩一句"验证失败"没法排查。
-    local verify_log="$work/verify.log"
-    local verify_ok=0
-    # 内核 >= 5.11 时连原生直跑都会段错误 (Bun epoll_pwait2), 直接用 proot -k 5.10.0
-    if kernel_needs_proot; then
-        info "内核 $(uname -r) >= 5.11: 用 proot -k 5.10.0 规避 Bun 的 epoll_pwait2 崩溃"
-    else
+    # 打补丁。注意: Termux 当前的 patchelf 0.19.2 会把这个 206MB 的 Bun
+    # 二进制改坏 —— 旧版产物 206572752 字节可正常运行, 0.19.2 的产物只有
+    # 206507216 字节, 一跑就 SIGSEGV (signal 11, 两台设备都复现)。
+    # 所以打完补丁必须验证, 不行就换"proot 绑定运行库"模式。
+    local mode=native verify_log="$work/verify.log" verify_ok=0
+    info "patchelf: interpreter → $INTERP"
+    patchelf --set-interpreter "$INTERP" "$new_bin" 2>/dev/null         || warn "patchelf interpreter 失败 (将改用 proot 绑定模式)"
+    info "patchelf: rpath → $RPATH"
+    patchelf --set-rpath "$RPATH" "$new_bin" 2>/dev/null         || warn "patchelf rpath 失败 (将改用 proot 绑定模式)"
+
+    if ! kernel_needs_proot; then
         env -u LD_PRELOAD "SSL_CERT_FILE=${SSL_CERT_FILE:-$PREFIX/etc/tls/cert.pem}" \
             "$new_bin" --version >"$verify_log" 2>&1 && verify_ok=1
     fi
     if [ "$verify_ok" -eq 0 ] && command -v proot >/dev/null 2>&1; then
         proot_run "$new_bin" --version >"$verify_log" 2>&1 && verify_ok=1
     fi
+
     if [ "$verify_ok" -ne 1 ]; then
-        warn "新二进制无法运行 (proot: $(command -v proot >/dev/null 2>&1 && echo 有 || echo 无), 内核: $(uname -r)), 最后一次尝试的输出:"
-        sed 's/^/    /' "$verify_log" 2>/dev/null | head -20
-        [ -f "${PREFIX}/etc/resolv.conf" ] || warn "缺少 ${PREFIX}/etc/resolv.conf (dns-bootstrap 未成功写入?)"
-        fail "新二进制验证失败 (无 root 请确保已安装 proot), 已放弃替换"
+        warn "patchelf 后的二进制跑不起来 (Termux patchelf 0.19.2 会改坏这个包)"
+        cat "$verify_log" 2>/dev/null | head -5 | sed 's/^/    /'
+        info "改用 proot 绑定运行库模式 (二进制保持官方原样, 由 proot 把运行库绑到标准路径)"
+        if ! command -v proot >/dev/null 2>&1; then
+            info "安装 proot…"
+            pkg install -y proot || true
+        fi
+        command -v proot >/dev/null 2>&1 \
+            || fail "该模式需要 proot, 但安装失败。请手动: pkg install proot"
+        new_bin="$work/opencode.orig"
+        chmod +x "$new_bin"
+        mode=proot-bind
+        verify_ok=0
+        proot_bind_run "$new_bin" --version >"$verify_log" 2>&1 && verify_ok=1
+        if [ "$verify_ok" -ne 1 ]; then
+            warn "proot 绑定模式下也无法运行, 最后一次输出:"
+            sed 's/^/    /' "$verify_log" 2>/dev/null | head -20
+            fail "新二进制验证失败, 已放弃替换"
+        fi
+        ok "proot 绑定模式验证通过"
     fi
 
     mkdir -p "$OPENCODE_DIR"
     mv -f "$new_bin" "$REAL_BIN"
     chmod +x "$REAL_BIN"
     echo "$version" > "$VERSION_FILE"
-    ok "OpenCode $version 已安装"
+    echo "$mode" > "$MODE_FILE"
+    ok "OpenCode $version 已安装 (运行模式: $mode)"
 }
 
 # ---------- 启动 wrapper ----------
@@ -1155,6 +1196,7 @@ HOME_DIR="$HOME"
 BIN_DIR="$HOME_DIR/.local/opencode"
 REAL_BIN="$BIN_DIR/opencode"
 VERSION_FILE="$BIN_DIR/.version"
+MODE_FILE="$BIN_DIR/.mode"      # native (patchelf) / proot-bind
 INTERP="$PREFIX/lib/ld-musl-aarch64.so.1"
 RPATH="$PREFIX/lib/musl"
 # V2 起官方走 npm 分发 (不再是 GitHub Releases)
@@ -1267,6 +1309,31 @@ proot_run() {
     proot "${opts[@]}" env -u LD_PRELOAD "SSL_CERT_FILE=${SSL_CERT_FILE:-$PREFIX/etc/tls/cert.pem}" "$bin" "$@"
 }
 
+# 不用 patchelf 的备选方案 (对应 install.sh 的 proot-bind 模式):
+# 二进制保持官方原样, 由 proot 把 musl 运行库绑到它原本要找的标准路径。
+proot_bind_run() {
+    local bin="$1"; shift
+    local opts=() fake=""
+    if kernel_needs_proot; then
+        opts+=(-k 5.10.0)
+        fake="$(fake_osrelease)"
+        if [ -n "$fake" ] && [ -f "$fake" ]; then
+            opts+=(-b "$fake:/proc/sys/kernel/osrelease")
+        fi
+    fi
+    opts+=(-b "${INTERP}:/lib/ld-musl-aarch64.so.1")
+    if [ -f "${RPATH}/libstdc++.so.6" ]; then
+        opts+=(-b "${RPATH}/libstdc++.so.6:/usr/lib/libstdc++.so.6")
+    fi
+    if [ -f "${RPATH}/libgcc_s.so.1" ]; then
+        opts+=(-b "${RPATH}/libgcc_s.so.1:/usr/lib/libgcc_s.so.1")
+    fi
+    if [ -f "${PREFIX}/etc/resolv.conf" ]; then
+        opts+=(-b "${PREFIX}/etc/resolv.conf:/etc/resolv.conf")
+    fi
+    proot "${opts[@]}" env -u LD_PRELOAD "SSL_CERT_FILE=${SSL_CERT_FILE:-$PREFIX/etc/tls/cert.pem}" "$bin" "$@"
+}
+
 # 本地已记录版本; 无记录时从二进制本身探测 (可能为空)
 current_version() {
     if [ -f "$VERSION_FILE" ]; then
@@ -1362,9 +1429,26 @@ case "${1:-}" in
            && ! printf '%s\n' "$@" | grep -qx -- '--standalone'; then
             set -- --standalone "$@"
         fi
-        # exec 不能调 bash 函数, 内联 proot 逻辑 (与 run_opencode 同优先级:
-        # 内核 >= 5.11 优先走 proot -k 5.10.0, 否则有 root 直跑, 无 root 走 proot)
-        if kernel_needs_proot && command -v proot >/dev/null 2>&1; then
+        # exec 不能调 bash 函数, 内联逻辑
+        RUN_MODE="$(cat "$MODE_FILE" 2>/dev/null || echo native)"
+        if [ "$RUN_MODE" = "proot-bind" ] && command -v proot >/dev/null 2>&1; then
+            # 未打补丁的官方二进制: 靠 proot 把运行库绑到标准路径
+            OSOPT=()
+            if kernel_needs_proot; then
+                FAKE_OS="$(fake_osrelease)"
+                if [ -n "$FAKE_OS" ] && [ -f "$FAKE_OS" ]; then
+                    OSOPT=(-k 5.10.0 -b "$FAKE_OS:/proc/sys/kernel/osrelease")
+                else
+                    OSOPT=(-k 5.10.0)
+                fi
+            fi
+            LIBOPT=(-b "${INTERP}:/lib/ld-musl-aarch64.so.1")
+            [ -f "${RPATH}/libstdc++.so.6" ] && LIBOPT+=(-b "${RPATH}/libstdc++.so.6:/usr/lib/libstdc++.so.6")
+            [ -f "${RPATH}/libgcc_s.so.1" ] && LIBOPT+=(-b "${RPATH}/libgcc_s.so.1:/usr/lib/libgcc_s.so.1")
+            DNSOPT=()
+            [ -f "${PREFIX}/etc/resolv.conf" ] && DNSOPT+=(-b "${PREFIX}/etc/resolv.conf:/etc/resolv.conf")
+            exec proot "${OSOPT[@]}" "${LIBOPT[@]}" "${DNSOPT[@]}" "$REAL_BIN" "$@"
+        elif kernel_needs_proot && command -v proot >/dev/null 2>&1; then
             FAKE_OS="$(fake_osrelease)"
             OSOPT=()
             if [ -n "$FAKE_OS" ] && [ -f "$FAKE_OS" ]; then

@@ -110,25 +110,39 @@ fallback_tarball_urls() {
     printf 'https://registry.npmjs.org/%s/%s/-/%s-%s.tgz\n' "$scope" "$name" "$name" "$1"
 }
 
-# $1=版本 $2=输出文件: 带进度条下载, 失败自动换镜像
+# $1=版本 $2=输出文件: 带进度条下载; 每次下载后校验完整性, 不通过就换源。
+# 背景同 install.sh: registry.npmjs.org 下 96MB 的包会被截断 (实测 4.3MB),
+# 而 curl 有时仍以 0 退出 → tar 解出残缺二进制 → patchelf 失败 → 验证时
+# 跑坏 ELF 段错误。所以必须校验大小 + gzip -t, 不通过就换源。
 download_tgz() {
-    local ver="$1" out="$2" url="" alt="" u
-    url="$(npm view "$NPM_PKG@$ver" dist.tarball 2>/dev/null | tail -1)" || url=""
-    if [ -n "$url" ]; then
-        curl -fSL --progress-bar --connect-timeout 15 --max-time 900 "$url" -o "$out" && return 0
-        case "$url" in
-            *registry.npmjs.org*)     alt="${url/registry.npmjs.org/registry.npmmirror.com}" ;;
-            *registry.npmmirror.com*) alt="${url/registry.npmmirror.com/registry.npmjs.org}" ;;
+    local ver="$1" out="$2"
+    local expect="" u="" alt="" got="" x="" urls=()
+    expect="$(npm view "$NPM_PKG@$ver" dist.size 2>/dev/null | tail -1)" || expect=""
+    u="$(npm view "$NPM_PKG@$ver" dist.tarball 2>/dev/null | tail -1)" || u=""
+    if [ -n "$u" ]; then
+        case "$u" in
+            *registry.npmjs.org*)     alt="${u/registry.npmjs.org/registry.npmmirror.com}"
+                                      urls+=("$alt" "$u") ;;
+            *registry.npmmirror.com*) alt="${u/registry.npmmirror.com/registry.npmjs.org}"
+                                      urls+=("$u" "$alt") ;;
+            *) urls+=("$u") ;;
         esac
-        if [ -n "$alt" ] && [ "$alt" != "$url" ]; then
-            warn "直连失败, 换镜像重试…"
-            curl -fSL --progress-bar --connect-timeout 15 --max-time 900 "$alt" -o "$out" && return 0
-        fi
     fi
-    warn "取不到 tarball URL, 改用固定 URL 规则直连…"
-    while read -r u; do
-        curl -fSL --progress-bar --connect-timeout 15 --max-time 900 "$u" -o "$out" && return 0
-    done < <(fallback_tarball_urls "$ver")
+    while read -r x; do urls+=("$x"); done < <(fallback_tarball_urls "$ver")
+
+    for u in "${urls[@]}"; do
+        curl -fSL --progress-bar --connect-timeout 15 --max-time 900 "$u" -o "$out" || continue
+        got="$(stat -c%s "$out" 2>/dev/null || echo 0)"
+        if [ -n "$expect" ] && [ "$got" != "$expect" ]; then
+            echo "!! 下载不完整 (${got} / 期望 ${expect} 字节), 换源重试…" >&2
+            continue
+        fi
+        if ! gzip -t "$out" 2>/dev/null; then
+            echo "!! tarball 校验失败 (gzip -t 未通过), 换源重试…" >&2
+            continue
+        fi
+        return 0
+    done
     return 1
 }
 

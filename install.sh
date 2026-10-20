@@ -118,6 +118,55 @@ proot_bind_run() {
     proot "${opts[@]}" env -u LD_PRELOAD "SSL_CERT_FILE=${SSL_CERT_FILE:-$PREFIX/etc/tls/cert.pem}" "$bin" "$@"
 }
 
+# ---------- patchelf 补丁 (两种实现) ----------
+# Termux 默认的 patchelf 是 0.19.2, 它会把这个 206MB 的 Bun 二进制改坏:
+# 退出码是 0 (看起来成功), 但产物一跑就 SIGSEGV (signal 11)。
+# 而 glibc 环境里的 patchelf 是 **0.19.1**, 实测产物能原生直跑:
+#   0.19.2 (bionic)      → 207162576 字节 → rc=139
+#   0.19.1 (glibc, grun) → 207228112 字节 → opencode v2.1.0, rc=0
+# 所以: 先试 bionic 版, 验证不过就上 glibc 版 (native 模式比 proot-bind 快,
+# 且后台服务不会卡在退出)。
+
+GLIBC_PATCHELF="$PREFIX/glibc/bin/patchelf"
+
+# 确保 glibc 版 patchelf 可用 (需要 grun + patchelf-glibc + glibc 环境)。
+# 返回 0 表示可用。首次安装会下载约 33MB、占用约 214MB 磁盘。
+install_glibc_patchelf() {
+    if command -v grun >/dev/null 2>&1 && [ -x "$GLIBC_PATCHELF" ]; then
+        return 0
+    fi
+    info "安装 glibc 版 patchelf (0.19.1, 能正确处理该二进制)…"
+    info "提示: 需下载约 33MB、占用约 214MB 磁盘, 首次会慢一些"
+    pkg install -y patchelf-glibc glibc glibc-runner gcc-libs-glibc >/dev/null 2>&1 || true
+    command -v grun >/dev/null 2>&1 && [ -x "$GLIBC_PATCHELF" ]
+}
+
+glibc_patchelf_version() {
+    grun "$GLIBC_PATCHELF" --version 2>/dev/null | head -1 || echo "版本未知"
+}
+
+# 打补丁 + 验证。$1=二进制 $2=未打补丁的原始副本 $3=bionic|glibc
+# 每次都从原始副本重新打, 保证前一次的产物不会残留。
+# 返回 0 = 补丁后能跑。
+patch_and_verify() {
+    local bin="$1" orig="$2" kind="$3"
+    local -a PE=(patchelf)
+    [ "$kind" = "glibc" ] && PE=(grun "$GLIBC_PATCHELF")
+
+    cp -f "$orig" "$bin" || return 1
+    "${PE[@]}" --set-interpreter "$INTERP" "$bin" 2>/dev/null || return 1
+    "${PE[@]}" --set-rpath "$RPATH" "$bin" 2>/dev/null || return 1
+
+    if ! kernel_needs_proot; then
+        env -u LD_PRELOAD "SSL_CERT_FILE=${SSL_CERT_FILE:-$PREFIX/etc/tls/cert.pem}" \
+            "$bin" --version >/dev/null 2>&1 && return 0
+    fi
+    if command -v proot >/dev/null 2>&1; then
+        proot_run "$bin" --version >/dev/null 2>&1 && return 0
+    fi
+    return 1
+}
+
 # ---------- 下载 ----------
 # 官方 API 形如 {"channel":"latest",...,"version":"2.0.32",...}
 oc_latest_version() {
@@ -1173,27 +1222,15 @@ install_opencode() {
     # 留一份未打补丁的原始二进制 (patchelf 失败时用它)
     cp "$new_bin" "$work/opencode.orig"
 
-    # 打补丁。注意: Termux 当前的 patchelf 0.19.2 会把这个 206MB 的 Bun
-    # 二进制改坏 —— 旧版产物 206572752 字节可正常运行, 0.19.2 的产物只有
-    # 206507216 字节, 一跑就 SIGSEGV (signal 11, 两台设备都复现)。
-    # 所以打完补丁必须验证, 不行就换"proot 绑定运行库"模式。
-    local mode=native verify_log="$work/verify.log" verify_ok=0
-    info "patchelf: interpreter → $INTERP"
-    patchelf --set-interpreter "$INTERP" "$new_bin" 2>/dev/null         || warn "patchelf interpreter 失败 (将改用 proot 绑定模式)"
-    info "patchelf: rpath → $RPATH"
-    patchelf --set-rpath "$RPATH" "$new_bin" 2>/dev/null         || warn "patchelf rpath 失败 (将改用 proot 绑定模式)"
-
-    if ! kernel_needs_proot; then
-        env -u LD_PRELOAD "SSL_CERT_FILE=${SSL_CERT_FILE:-$PREFIX/etc/tls/cert.pem}" \
-            "$new_bin" --version >"$verify_log" 2>&1 && verify_ok=1
-    fi
-    if [ "$verify_ok" -eq 0 ] && command -v proot >/dev/null 2>&1; then
-        proot_run "$new_bin" --version >"$verify_log" 2>&1 && verify_ok=1
-    fi
-
-    if [ "$verify_ok" -ne 1 ]; then
-        warn "patchelf 后的二进制跑不起来 (Termux patchelf 0.19.2 会改坏这个包)"
-        cat "$verify_log" 2>/dev/null | head -5 | sed 's/^/    /'
+    # 打补丁必须验证: patchelf 0.19.2 退出码为 0 但产物是坏的, 光看返回值
+    # 判断不出来。两种 patchelf 依次尝试, 都不行才退到 proot-bind。
+    local mode=native verify_log="$work/verify.log"
+    if patch_and_verify "$new_bin" "$work/opencode.orig" bionic; then
+        ok "patchelf 补丁验证通过 (bionic $(patchelf --version 2>/dev/null | head -1))"
+    elif install_glibc_patchelf && patch_and_verify "$new_bin" "$work/opencode.orig" glibc; then
+        ok "patchelf 补丁验证通过 (glibc 版 $(glibc_patchelf_version))"
+    else
+        warn "两种 patchelf 都跑不起来 (0.19.2 会把该二进制改坏)"
         info "改用 proot 绑定运行库模式 (二进制保持官方原样, 由 proot 把运行库绑到标准路径)"
         if ! command -v proot >/dev/null 2>&1; then
             info "安装 proot…"
@@ -1413,7 +1450,42 @@ version_ge() {
     [ "$(printf '%s\n%s\n' "$a" "$b" | sort -V | tail -n1)" = "$a" ]
 }
 
-# 下载 → 解压 → patchelf → 验证 → 原子换入。失败返回 1 (保留旧二进制)。
+GLIBC_PATCHELF="$PREFIX/glibc/bin/patchelf"
+
+# 确保 glibc 版 patchelf (0.19.1) 可用 —— 0.19.2 会把该二进制改坏。
+# 首次安装会下载约 33MB、占用约 214MB 磁盘。
+install_glibc_patchelf() {
+    if command -v grun >/dev/null 2>&1 && [ -x "$GLIBC_PATCHELF" ]; then
+        return 0
+    fi
+    echo "==> 安装 glibc 版 patchelf (0.19.1, 能正确处理该二进制)…" >&2
+    echo "    (需下载约 33MB、占用约 214MB 磁盘, 首次会慢一些)" >&2
+    pkg install -y patchelf-glibc glibc glibc-runner gcc-libs-glibc >/dev/null 2>&1 || true
+    command -v grun >/dev/null 2>&1 && [ -x "$GLIBC_PATCHELF" ]
+}
+
+# 打补丁 + 验证。$1=二进制 $2=未打补丁的原始副本 $3=bionic|glibc
+# 每次都从原始副本重新打, 避免上一次的产物残留。
+patch_and_verify() {
+    local bin="$1" orig="$2" kind="$3"
+    local -a PE=(patchelf)
+    [ "$kind" = "glibc" ] && PE=(grun "$GLIBC_PATCHELF")
+
+    cp -f "$orig" "$bin" || return 1
+    "${PE[@]}" --set-interpreter "$INTERP" "$bin" 2>/dev/null || return 1
+    "${PE[@]}" --set-rpath "$RPATH" "$bin" 2>/dev/null || return 1
+
+    if ! kernel_needs_proot; then
+        env -u LD_PRELOAD "SSL_CERT_FILE=${SSL_CERT_FILE:-$PREFIX/etc/tls/cert.pem}" \
+            "$bin" --version >/dev/null 2>&1 && return 0
+    fi
+    if command -v proot >/dev/null 2>&1; then
+        proot_run "$bin" --version >/dev/null 2>&1 && return 0
+    fi
+    return 1
+}
+
+# 下载 → 解压 → 打补丁 → 验证 → 原子换入。失败返回 1 (保留旧二进制)。
 do_update() {
     local VERSION="$1"
     echo "==> 下载 $NPM_PKG v$VERSION (约 96MB 包 / 206MB 二进制) …"
@@ -1437,23 +1509,18 @@ do_update() {
     # 留一份未打补丁的原始二进制
     cp "$NEW_BIN" "$TMP/opencode.orig" || return 1
 
-    local mode
-    mode="$(cat "$MODE_FILE" 2>/dev/null || echo native)"
-
-    # 已经是 proot-bind 模式 → 别再做无谓的 patchelf (它必定失败), 直接跳过
-    if [ "$mode" = "proot-bind" ]; then
-        echo "==> 当前为 proot-bind 模式, 跳过 patchelf (Termux patchelf 0.19.2 会改坏该二进制)"
+    # 打补丁必须验证: patchelf 0.19.2 退出码是 0 但产物是坏的。
+    # 即使是 proot-bind 模式也要再试一次 —— glibc 版 patchelf 0.19.1 能修好,
+    # 成功后即可回到 native 模式 (更快, 且后台服务不会卡在退出)。
+    local mode=native
+    echo "==> 打补丁: interpreter + rpath …"
+    if patch_and_verify "$NEW_BIN" "$TMP/opencode.orig" bionic; then
+        echo "==> 补丁验证通过 (bionic patchelf)"
+    elif install_glibc_patchelf && patch_and_verify "$NEW_BIN" "$TMP/opencode.orig" glibc; then
+        echo "==> 补丁验证通过 (glibc 版 patchelf $(grun "$GLIBC_PATCHELF" --version 2>/dev/null | head -1))"
     else
-        echo "==> patchelf: interpreter + rpath …"
-        patchelf --set-interpreter "$INTERP" "$NEW_BIN" 2>/dev/null \
-            || echo "!! patchelf interpreter 失败 (将改用 proot 绑定模式)" >&2
-        patchelf --set-rpath "$RPATH" "$NEW_BIN" 2>/dev/null \
-            || echo "!! patchelf rpath 失败 (将改用 proot 绑定模式)" >&2
-    fi
-
-    # 验证能跑再替换; 打过补丁的按 native 验证, 跑不起来就换 proot-bind 再验一次
-    if ! run_opencode "$NEW_BIN" --version >/dev/null 2>&1; then
-        echo "!! patchelf 后的二进制跑不起来, 改用 proot 绑定运行库模式再试…" >&2
+        echo "!! 两种 patchelf 都跑不起来 (0.19.2 会把该二进制改坏)" >&2
+        echo "==> 改用 proot 绑定运行库模式…" >&2
         if ! command -v proot >/dev/null 2>&1; then
             pkg install -y proot >/dev/null 2>&1 || true
         fi

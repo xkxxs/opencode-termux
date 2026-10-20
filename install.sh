@@ -1317,7 +1317,13 @@ download_asset() {
 run_opencode() {
     local bin="$1"; shift
     local _env="env -u LD_PRELOAD SSL_CERT_FILE=${SSL_CERT_FILE:-$PREFIX/etc/tls/cert.pem}"
-    if kernel_needs_proot && command -v proot >/dev/null 2>&1; then
+    # proot-bind 模式: 二进制未打补丁, 必须经 proot 把 musl 运行库绑到标准路径;
+    # 直接跑或只走 proot_run 都会因为找不到 interpreter 而失败
+    # (报 "No such file or directory", 其实是 /lib/ld-musl-aarch64.so.1 不存在)
+    if [ "$(cat "$MODE_FILE" 2>/dev/null || echo native)" = "proot-bind" ] \
+       && command -v proot >/dev/null 2>&1; then
+        proot_bind_run "$bin" "$@"
+    elif kernel_needs_proot && command -v proot >/dev/null 2>&1; then
         proot_run "$bin" "$@"
     elif command -v sudo >/dev/null 2>&1 && sudo -n true 2>/dev/null; then
         $_env "$bin" "$@"
@@ -1427,19 +1433,45 @@ do_update() {
     local NEW_BIN="$TMP/package/bin/opencode"
     [ -f "$NEW_BIN" ] || { echo "!! tarball 内未找到 package/bin/opencode" >&2; return 1; }
     chmod +x "$NEW_BIN"
-    echo "==> patchelf: interpreter + rpath …"
-    patchelf --set-interpreter "$INTERP" "$NEW_BIN" || return 1
-    patchelf --set-rpath "$RPATH" "$NEW_BIN" || return 1
+    # 留一份未打补丁的原始二进制
+    cp "$NEW_BIN" "$TMP/opencode.orig" || return 1
 
-    # 验证能跑再替换; 失败则保留旧二进制
-    if ! run_opencode "$NEW_BIN" --version >/dev/null 2>&1; then
-        echo "!! 新二进制无法运行, 已回滚(旧版保留)" >&2
-        return 1
+    local mode
+    mode="$(cat "$MODE_FILE" 2>/dev/null || echo native)"
+
+    # 已经是 proot-bind 模式 → 别再做无谓的 patchelf (它必定失败), 直接跳过
+    if [ "$mode" = "proot-bind" ]; then
+        echo "==> 当前为 proot-bind 模式, 跳过 patchelf (Termux patchelf 0.19.2 会改坏该二进制)"
+    else
+        echo "==> patchelf: interpreter + rpath …"
+        patchelf --set-interpreter "$INTERP" "$NEW_BIN" 2>/dev/null \
+            || echo "!! patchelf interpreter 失败 (将改用 proot 绑定模式)" >&2
+        patchelf --set-rpath "$RPATH" "$NEW_BIN" 2>/dev/null \
+            || echo "!! patchelf rpath 失败 (将改用 proot 绑定模式)" >&2
     fi
+
+    # 验证能跑再替换; 打过补丁的按 native 验证, 跑不起来就换 proot-bind 再验一次
+    if ! run_opencode "$NEW_BIN" --version >/dev/null 2>&1; then
+        echo "!! patchelf 后的二进制跑不起来, 改用 proot 绑定运行库模式再试…" >&2
+        if ! command -v proot >/dev/null 2>&1; then
+            pkg install -y proot >/dev/null 2>&1 || true
+        fi
+        if command -v proot >/dev/null 2>&1 && proot_bind_run "$TMP/opencode.orig" --version >/dev/null 2>&1; then
+            mode=proot-bind
+            NEW_BIN="$TMP/opencode.orig"
+            chmod +x "$NEW_BIN"
+            echo "==> proot 绑定模式验证通过" >&2
+        else
+            echo "!! 新二进制无法运行, 已回滚(旧版保留)" >&2
+            return 1
+        fi
+    fi
+
     mv -f "$NEW_BIN" "$REAL_BIN" || return 1
     chmod +x "$REAL_BIN"
     echo "$VERSION" > "$VERSION_FILE"
-    echo "✓ 更新完成: $(run_opencode "$REAL_BIN" --version)"
+    echo "$mode" > "$MODE_FILE"
+    echo "✓ 更新完成: $(run_opencode "$REAL_BIN" --version) (模式: $mode)"
 }
 
 case "${1:-}" in

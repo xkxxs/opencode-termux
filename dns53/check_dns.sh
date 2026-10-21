@@ -20,8 +20,8 @@ if [ -f "$DNS_DIR/root.sh" ]; then
 fi
 if [ "$HAVE_ROOT" = 1 ]; then
   echo "root: 可用 (模式: $ROOT_MODE, dns53 方案)"
-  if dns53_root_exec pgrep -f 'dns5[3]\.js' >/dev/null 2>&1; then
-    echo "dns53: 运行中"
+  if dns53_alive; then
+    echo "dns53: 运行中 (心跳)"
   else
     echo "dns53: ★ 未运行 (重开终端, 或 bash $DNS_DIR/install.sh)"
   fi

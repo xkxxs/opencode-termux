@@ -149,6 +149,15 @@ dns53 需要 root 才能监听 `127.0.0.1:53`。Android 上**有 root 不等于�
 > `su -c` 首次会弹 Magisk/KernelSU 授权框,授权一次(建议选"永久")后不再弹。
 > 不想看到弹窗也可以 `pkg install sudo`,走第 2 条。
 
+root 模式下 dns53 每 20 秒写一次心跳 `~/.local/share/dns53/.alive`,wrapper 启动时:
+
+- 心跳新鲜(90s 内) → 把 musl 实际读取的 `/sdcard/.oc-resolv` 写成 `nameserver 127.0.0.1`,
+  所有请求走 dns53(带多上游故障转移与 AAAA 屏蔽)
+- 心跳缺失/过期(dns53 没起来、被杀、53 端口被占) → 自动回退到 `dns-bootstrap`
+  实测出的可用上游 DNS,不会因为「有 root 但 dns53 挂了」导致整个 DNS 失效
+
+`.bashrc` 钩子也用同一个心跳判断,不再每次开 shell 都 `su pgrep`。
+
 ## 历史会话在哪
 
 从 V1 升上来后可能以为"历史没了"——**数据没丢,是 V2 的首屏不显示历史列表**

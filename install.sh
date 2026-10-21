@@ -732,6 +732,16 @@ root_available() {
     return 1
 }
 
+# dns53 是否真在跑: 看它 90s 内有没有写心跳文件 (普通用户可读, 不需要 su)
+# 只看 root_available 会误判: 有 root 但 dns53 没起来时, 跳过了无 root 兜底 → DNS 全挂
+dns53_alive() {
+    local f="$DNS53_DIR/.alive" now mt
+    [ -f "$f" ] || return 1
+    now=$(date +%s)
+    mt=$(stat -c %Y "$f" 2>/dev/null || echo 0)
+    [ $((now - mt)) -lt 90 ]
+}
+
 export SSL_CERT_FILE="${SSL_CERT_FILE:-$PREFIX/etc/tls/cert.pem}"
 # V2 自带自动更新: 它会下载官方原始二进制直接替换, 而那份没有经过
 # patchelf (interpreter 还是 /lib/ld-musl-aarch64.so.1) → 在 Termux 上又跑不起来。
@@ -801,7 +811,7 @@ download_asset() {
 refresh_dns_nonroot() {
     [ -f "$DNS_BOOT" ] || return 0
     command -v node >/dev/null 2>&1 || return 0
-    if root_available; then return 0; fi
+    if root_available && dns53_alive; then return 0; fi
     local conf="$PREFIX/etc/resolv.conf" now mt
     now=$(date +%s)
     if [ -f "$conf" ]; then
@@ -1113,7 +1123,13 @@ case "${1:-}" in
         # musl 实际读的是 /sdcard/.oc-resolv (见 ensure_musl_loader), 先保证它存在且最新
         ensure_musl_loader 2>/dev/null || true
         ensure_storage_access || true
-        sync_resolv_shim
+        if root_available && dns53_alive; then
+            # root + dns53 常驻: 明确指向本地转发器, 避免沿用上次网络残留的上游 DNS
+            printf 'nameserver 127.0.0.1\n' > "$RESOLV_SHIM" 2>/dev/null || true
+        else
+            # dns53 不在 (没起来/已退出): 回退到 dns-bootstrap 实测出的可用上游
+            sync_resolv_shim
+        fi
         # 自动更新: 启动前快速检查最新版本 (短超时, 网络差时静默跳过),
         # 非最新则自动更新; 更新失败不阻塞, 用现有版本启动。
         if [ "${OPENCODE_NO_AUTO_UPDATE:-0}" != "1" ]; then

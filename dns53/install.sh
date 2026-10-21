@@ -34,7 +34,7 @@ root_exec() { dns53_root_exec "$@"; }
 load_root_mode() { dns53_load_root_mode "$@"; }
 
 is_running() {
-    have_root && root_exec pgrep -f '^node .*dns5[3]\.js' >/dev/null 2>&1
+    dns53_alive
 }
 
 # $1 是否比 $2 新 (按版本号排序)
@@ -65,30 +65,32 @@ write_bashrc() {
 DNS53_DIR="${XDG_DATA_HOME:-$HOME/.local/share}/dns53"
 if [ -f "$DNS53_DIR/dns53.js" ] && [ -f "$DNS53_DIR/.root_mode" ]; then
     _dns53_mode="$(cat "$DNS53_DIR/.root_mode" 2>/dev/null)"
-    case "$_dns53_mode" in
-        su)
-            if ! su -c "pgrep -f '^node .*dns5[3]\.js'" >/dev/null 2>&1; then
+    # 心跳 120s 内 → 认为在跑, 不再 su pgrep (省掉每次开 shell 的授权提示)
+    _dns53_alive=0
+    if [ -f "$DNS53_DIR/.alive" ]; then
+        _dns53_mt=$(stat -c %Y "$DNS53_DIR/.alive" 2>/dev/null || echo 0)
+        [ $(( $(date +%s) - _dns53_mt )) -lt 120 ] && _dns53_alive=1
+    fi
+    if [ "$_dns53_alive" = 0 ]; then
+        case "$_dns53_mode" in
+            su)
                 mkdir -p "$DNS53_DIR/logs"
-                ( su -c "nohup node '$DNS53_DIR/dns53.js'" >> "$DNS53_DIR/logs/dns53.log" 2>&1 & )
+                ( su -c "PATH=${PREFIX:-/data/data/com.termux/files/usr}/bin:/system/bin:/system/xbin:\$PATH nohup node '$DNS53_DIR/dns53.js'" >> "$DNS53_DIR/logs/dns53.log" 2>&1 & )
                 sleep 1
-            fi
-            ;;
-        direct)
-            if ! pgrep -f '^node .*dns5[3]\.js' >/dev/null 2>&1; then
+                ;;
+            direct)
                 mkdir -p "$DNS53_DIR/logs"
                 nohup node "$DNS53_DIR/dns53.js" >> "$DNS53_DIR/logs/dns53.log" 2>&1 &
                 sleep 1
-            fi
-            ;;
-        sudo)
-            if ! sudo -n pgrep -f '^node .*dns5[3]\.js' >/dev/null 2>&1; then
+                ;;
+            sudo)
                 mkdir -p "$DNS53_DIR/logs"
                 sudo -n nohup node "$DNS53_DIR/dns53.js" >> "$DNS53_DIR/logs/dns53.log" 2>&1 &
                 sleep 1
-            fi
-            ;;
-    esac
-    unset _dns53_mode
+                ;;
+        esac
+    fi
+    unset _dns53_mode _dns53_alive _dns53_mt
 fi
 # <<< dns53 <<<
 BASHRC_EOF
@@ -174,6 +176,13 @@ activate() {
         cur="$(root_exec pgrep -af '^node .*dns5[3]\.js' 2>/dev/null || true)"
         if [ -n "$cur" ] && ! printf '%s\n' "$cur" | grep -qF "$DNS_DIR/dns53.js"; then
             info "检测到旧路径的 dns53, 重启以切换到独立目录"
+            root_exec pkill -f '^node .*dns5[3]\.js' 2>/dev/null || true
+            sleep 1
+        fi
+        # 2.2.0 之前没有心跳文件: 进程在跑但 .alive 缺失/过期 → 重启加载新代码,
+        # 否则 start_dns53 会因 53 端口被占而启动失败, 旧进程继续跑且没有心跳。
+        if ! is_running && root_exec pgrep -f '^node .*dns5[3]\.js' >/dev/null 2>&1; then
+            info "检测到旧版本 dns53 (无心跳), 重启以加载新代码"
             root_exec pkill -f '^node .*dns5[3]\.js' 2>/dev/null || true
             sleep 1
         fi

@@ -37,12 +37,26 @@ dns53_load_root_mode() {
 
 dns53_have_root() { [ "${ROOT_MODE:-none}" != none ]; }
 
+# dns53 是否活着: 心跳文件 90s 内更新过 (普通用户即可判断, 不需要 su)
+dns53_alive() {
+    local f="${DNS_DIR}/.alive" now mt
+    [ -f "$f" ] || return 1
+    now=$(date +%s)
+    mt=$(stat -c %Y "$f" 2>/dev/null || echo 0)
+    [ $((now - mt)) -lt 90 ]
+}
+
 # 按后端执行: direct 直接跑, sudo 用 -n (不弹窗), su 用 -c (带正确转义)
 dns53_root_exec() {
     case "${ROOT_MODE:-none}" in
         direct) "$@" ;;
         sudo)   sudo -n "$@" ;;
-        su)     su -c "$(printf '%q ' "$@")" ;;
+        su)
+            # Magisk/KernelSU 的 root shell PATH 可能不含 Termux 的 bin
+            # (node/nohup 会找不到), 这里显式补上。
+            local p="${PREFIX:-/data/data/com.termux/files/usr}/bin"
+            su -c "PATH=$p:/system/bin:/system/xbin:\$PATH $(printf '%q ' "$@")"
+            ;;
         *)      return 1 ;;
     esac
 }

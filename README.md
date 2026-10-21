@@ -2,8 +2,11 @@
 
 在 Termux (Android ARM64) 上一键安装**官方** OpenCode CLI **V2**,纯脚本方案,不发布 npm 分发包。
 
-> 官方 `@opencode/cli-linux-arm64-musl` 包 + `patchelf` 改 interpreter/rpath,
-> 运行库取自 Alpine Linux (ld-musl + libstdc++ + libgcc),经本地 DNS 转发器解析。
+> 官方 `@opencode/cli-linux-arm64-musl` 包 + `patchelf` **只改 interpreter**,
+> 运行库取自 Alpine Linux (ld-musl + libstdc++ + libgcc),**原生直跑, 不需要 proot**。
+
+**无 root / 无 proot**:DNS 通过一份“私有 musl loader 副本 + `/sdcard/.oc-resolv`”
+解决,安装时会请求共享存储权限。详见下文[为什么不用 proot](#为什么不用-proot)。
 
 **V1 用户看这里**:V2 是官方推倒重建的版本,分发方式从 GitHub Releases 改成了
 **npm** (下载页只列了 x64,但 npm 上有 `linux-arm64-musl`)。
@@ -14,9 +17,10 @@ V1 的适配已归档到 [OpenCodeV1-Termux](https://github.com/xkxxs/OpenCodeV1
 | 组件 | 来源 | 说明 |
 |---|---|---|
 | `opencode` 二进制 | npm `@opencode/cli-linux-arm64-musl` | 动态链接 musl (非静态),不能直接跑 |
-| `ld-musl-aarch64.so.1` | Alpine musl 包 | patchelf 设为 interpreter |
-| `libstdc++.so.6` + `libgcc_s.so.1` | Alpine latest-stable 包 | patchelf 设为 rpath (`$PREFIX/lib/musl`) |
-| DNS | `dns53/` 独立组件 | 装在 `~/.local/share/dns53`,与任何 agent 目录解耦;Android 无 `/etc/resolv.conf`,musl 解析器回退 127.0.0.1:53 无人监听 → 卡死 5s |
+| `ld-musl-aarch64.so.1` | Alpine musl 包 | 装到 `$PREFIX/lib`,patchelf 设为 interpreter |
+| `ld-musl-aarch64.so.1` 私有副本 | 上面的 loader 复制到 `~/.local/opencode/` | 只把编译死的 `"/etc/resolv.conf"` 原地改写成 `/sdcard/.oc-resolv` (系统 loader 不动) |
+| `libstdc++.so.6` + `libgcc_s.so.1` | Alpine latest-stable 包 | 由 wrapper 用 `LD_LIBRARY_PATH=$PREFIX/lib/musl` 提供,**不写 rpath** |
+| DNS | `dns53/` 独立组件 + `/sdcard/.oc-resolv` | Android 无 `/etc/resolv.conf`,musl 回退 `127.0.0.1:53` 无人监听 → 超时;见下节 |
 
 **下载走 npm**:先用 `npm view ... dist.tarball` 解析真实 URL (**跟随你配置的 registry**,
 比如配了 npmmirror 就直接走它),再 `curl --progress-bar` 下载;失败自动换另一个镜像。
@@ -25,11 +29,34 @@ V1 的适配已归档到 [OpenCodeV1-Termux](https://github.com/xkxxs/OpenCodeV1
 它判定 musl 靠 `/etc/alpine-release` 或 `ldd --version | grep musl`,
 Termux 两个都不满足,会给你装** glibc 版 **,直接跑不起来。本脚本写死 musl 变体。
 
+## 为什么不用 proot
+
+以前无 root 只能靠 proot 把运行库和 `resolv.conf` 绑到标准路径,代价是:
+
+- 每次启动多一层 ptrace 拦截(慢);
+- 后台服务在 proot 下退出时会卡住(只能退回 `--standalone`);
+- 部分机型的 seccomp 会拦 `epoll_pwait2`,还要额外伪装内核版本。
+
+现在两步就够了:
+
+1. **不打 rpath。** `patchelf --set-rpath` 配 musl 在 Android 上会让这个 206MB 的
+   Bun 二进制一跑就 SIGSEGV(exit 139)。运行库改用 `LD_LIBRARY_PATH` 提供。
+2. **私有 loader + 短路径。** musl 把 `/etc/resolv.conf` 编译死在 loader 里,而
+   Android 的 `/etc` 是只读的 `/system/etc`。无 root 又不能监听 53 端口。
+   于是复制一份 loader,把字符串原地改成 `/sdcard/.oc-resolv`——字符串后面只有
+   6 个 NUL 填充字节,最长 22 字符,app 私有目录的路径都更长,**只有 `/sdcard` 够短**。
+   wrapper 每次启动把真实 DNS 配置同步到这个文件。
+
+所以需要**共享存储权限**(安装脚本会自动请求)。proot 代码只作为极端情况的兜底保留,
+正常路径完全不会用到。
+
 ## 前置要求
 
 - Termux + aarch64 (ARM64)
-- 有 root: dns53 原生方案 (推荐)
-- 无 root: 自动改用 dns-bootstrap + proot 兜底
+- **共享存储权限** —— 安装脚本会自动调 `termux-setup-storage` 请求
+  (两阶段:先弹系统权限窗,再在 Termux 里确认 `y` 建 `~/storage`),请点“允许”。
+  DNS 配置要放在 `/sdcard/.oc-resolv`,没有权限会**联网超时**
+- 不需要 root,也不需要 proot(proot 仅作极端情况兜底)
 
 ## 一行命令安装
 
@@ -52,12 +79,14 @@ bash <(curl -fsSL https://gh-proxy.com/https://raw.githubusercontent.com/xkxxs/o
 | 步骤 | 说明 |
 |---|---|
 | 环境检查 | 仅支持 Termux + aarch64 |
-| 依赖安装 | `pkg install patchelf nodejs-lts sudo/proot` (有 root 装 sudo, 无 root 自动装 proot) |
+| 存储权限 | `termux-setup-storage` 两阶段请求(已在则跳过),DNS 配置需要 `/sdcard` 可写 |
+| 依赖安装 | `pkg install patchelf nodejs-lts curl`(不需要 sudo,也不需要 proot) |
 | musl 运行库 | 从 Alpine 获取 ld-musl + libstdc++ + libgcc (已存在则跳过) |
-| DNS 修复 | 安装独立的 `dns53` 组件到 `~/.local/share/dns53` (不属于任何 agent); 有 root 走 dns53 转发器 + `.bashrc` 常驻, 无 root 走 dns-bootstrap + proot 绑定 |
-| 安装 OpenCode | opencode.ai API 查最新版 (npm view 兜底) → 下载 tarball → patchelf ×2 → 验证 → 换入 |
-| 生成 wrapper | `~/.local/bin/opencode`: 启动前自动查版更新、`opencode update` 完整升级流程、关掉官方自动更新、修复 `~/.opencode/bin` PATH 陷阱 |
-| 验证 | `opencode --version` |
+| 私有 loader | 复制 `ld-musl-aarch64.so.1` 到 `~/.local/opencode/`,把 `/etc/resolv.conf` 改写成 `/sdcard/.oc-resolv` |
+| DNS 修复 | 安装独立的 `dns53` 组件到 `~/.local/share/dns53`;wrapper 启动时同步 `/sdcard/.oc-resolv` |
+| 安装 OpenCode | opencode.ai API 查最新版 (npm view 兜底) → 下载 tarball → **只打 interpreter** → 原生直跑验证 → 换入 |
+| 生成 wrapper | `~/.local/bin/opencode`: 原生直跑、自动查版更新、`opencode update` 完整升级流程、关掉官方自动更新、修复 `~/.opencode/bin` PATH 陷阱 |
+| 验证 | `opencode --version`,并报告运行模式 / loader / DNS shim |
 
 ## 使用
 
@@ -129,10 +158,10 @@ app-server daemon 那样卡死),TUI 也正常。
 opencode --standalone        # 或 OPENCODE_STANDALONE=1 由 wrapper 自动附加
 ```
 
-### proot-bind 模式下默认走 standalone
+### proot-bind 兜底模式下默认走 standalone
 
-如果安装时因为 patchelf 把二进制改坏而落到了 **proot-bind** 模式
-(`cat ~/.local/opencode/.mode`),wrapper 会**自动附加 `--standalone`**。原因:
+正常安装都是 `native` 模式(`cat ~/.local/opencode/.mode`),只有原生直跑验证失败时
+才会退到 **proot-bind**。该模式下 wrapper 会**自动附加 `--standalone`**,原因:
 
 该模式下后台服务虽然能起来、也能正常返回结果,但**客户端干完活不退出** ——
 表现为 TUI 里 `/exit` 或 Ctrl+C 之后一直停在 "Starting background server…",
@@ -164,12 +193,14 @@ export ANTHROPIC_MODEL=deepseek-v4-flash
 
 | 症状 | 原因 | 解决 |
 |---|---|---|
-| `cannot execute: required file not found` | 二进制 interpreter 不存在 | 重跑 `bash install.sh` (自动 patchelf) |
+| `cannot execute: required file not found` | 二进制 interpreter 不存在 | 重跑 `bash install.sh` (自动打补丁 + 重建私有 loader) |
 | `Error relocating libtermux-exec-ld-preload.so: __register_atfork` | termux-exec 的 LD_PRELOAD hook (Bionic) 被 musl 加载 | wrapper 已 `unset LD_PRELOAD` |
-| API 请求恰好卡 5s 超时 | DNS 卡死 (musl 读不到 resolv.conf) | dns53/dns-bootstrap 已自动处理; `bash ~/.local/share/dns53/check_dns.sh` 诊断 |
+| API 请求恰好卡 5s 超时 / `getaddrinfo ETIMEOUT` | musl 读不到 DNS 配置 | 检查 `/sdcard/.oc-resolv` 是否存在、存储权限是否给了;`bash ~/.local/share/dns53/check_dns.sh` 诊断 |
+| 启动时提示 `需要存储权限` 或弹权限窗 | 共享存储权限未授予,写不进 `/sdcard/.oc-resolv` | 允许 Termux 的存储权限,或手动 `termux-setup-storage`;`~/.local/opencode/.storage-denied` 会缓存 5 分钟避免反复弹窗 |
 | `-S: error while loading shared libraries` | Termux 命令在特定 shell 的怪癖 | 用完整路径调用或重登 shell |
 | glibc 版 Segfault | 用错了非 musl 构建 (官方脚本在 Termux 上就会选错) | 本方案写死 musl 变体,不要直接跑官网的 install 脚本 |
 | 更新后突然 `cannot execute: required file not found` | 被官方自动更新替换成了没打补丁的二进制 | wrapper 已关掉官方自动更新; 出问题时重跑 `opencode update --force` |
+| `opencode` 启动后一直用 proot / 很慢 | 落到了 proot-bind 兜底模式 | `cat ~/.local/opencode/.mode`;重跑 `opencode update --force` 或 `bash install.sh` 回到 native |
 | V1 的会话历史 | V2 会迁移 V1 数据 | 默认共用 `~/.local/share/opencode`,升级后历史仍在 |
 
 ## V1 → V2

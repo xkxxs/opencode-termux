@@ -1,7 +1,7 @@
 #!/data/data/com.termux/files/usr/bin/bash
 # ============================================================
 # opencode-termux — 在 Termux (Android aarch64) 上一键安装官方 OpenCode CLI V2
-# 方案: 官方 musl 动态链接版 + patchelf 改 interpreter/rpath
+# 方案: 官方 musl 动态链接版 + patchelf 只改 interpreter, 原生直跑 (无需 proot)
 #
 # 用法:
 #   bash <(curl -fsSL https://raw.githubusercontent.com/xkxxs/opencode-termux/main/install.sh)
@@ -14,13 +14,17 @@
 # 原理:
 #   官方 @opencode/cli-linux-arm64-musl 是动态链接 musl (非静态!),
 #   Android 没有 musl 运行环境, 需从 Alpine 获取 ld-musl-aarch64.so.1
-#   + libstdc++.so.6 + libgcc_s.so.1, 再用 patchelf 改二进制:
-#     interpreter → /usr/lib/ld-musl-aarch64.so.1
-#     rpath       → /usr/lib/musl
+#   + libstdc++.so.6 + libgcc_s.so.1, 再用 patchelf 只改二进制的一项:
+#     interpreter → ~/.local/opencode/ld-musl-aarch64.so.1 (私有 loader 副本)
+#   运行库不走 rpath, 由 wrapper 用 LD_LIBRARY_PATH=$PREFIX/lib/musl 提供。
+#   改 rpath 会让二进制在无 root 的 Termux 上 SIGSEGV (exit 139), 所以不做。
 #
-#   DNS: musl 解析器读不到 /etc/resolv.conf (Android 没有), 回退
-#   127.0.0.1:53 无人监听 → 卡死 5s。有 root 用 dns53 转发器;
-#   无 root 用 dns-bootstrap 实测校验 + proot 绑定 resolv.conf。
+#   DNS: musl 把 "/etc/resolv.conf" 编译死在 loader 里, 而 Android 的 /etc
+#   是只读的 /system/etc (没有该文件) → 回退 127.0.0.1:53 无人监听 → 超时。
+#   无 root 又不能监听 53 端口。解法: 私有 loader 副本里把该字符串原地改成
+#   /sdcard/.oc-resolv (够短且 App 可写), wrapper 每次启动同步真实 DNS 配置。
+#   因此安装时必须拿到共享存储权限 (termux-setup-storage 两阶段, 见下)。
+#   proot 只作为极端情况的兜底, 正常路径完全不使用。
 # ============================================================
 set -euo pipefail
 
@@ -36,6 +40,11 @@ WRAPPER_PATH="$HOME_DIR/.local/bin/opencode"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" 2>/dev/null && pwd || true)"
 INTERP="$PREFIX/lib/ld-musl-aarch64.so.1"
 RPATH="$PREFIX/lib/musl"
+# 私有 loader 副本: 唯一目的是把编译死的 "/etc/resolv.conf" 原地改成
+# /sdcard/.oc-resolv (Android 上无 root 唯一够短的可写路径)。系统 loader 不动。
+MUSL_LOADER="$OPENCODE_DIR/ld-musl-aarch64.so.1"
+RESOLV_SRC="$PREFIX/etc/resolv.conf"
+RESOLV_SHIM="/sdcard/.oc-resolv"
 CERT_FILE="$PREFIX/etc/tls/cert.pem"
 # V2 起官方改用 npm 分发, 不再走 GitHub Releases (V1 仍在 GitHub 发版,
 # 已归档到 xkxxs/OpenCodeV1-Termux)。musl ARM64 平台包:
@@ -120,53 +129,54 @@ proot_bind_run() {
     proot "${opts[@]}" env -u LD_PRELOAD "SSL_CERT_FILE=${SSL_CERT_FILE:-$PREFIX/etc/tls/cert.pem}" "$bin" "$@"
 }
 
-# ---------- patchelf 补丁 (两种实现) ----------
-# Termux 默认的 patchelf 是 0.19.2, 它会把这个 206MB 的 Bun 二进制改坏:
-# 退出码是 0 (看起来成功), 但产物一跑就 SIGSEGV (signal 11)。
-# 而 glibc 环境里的 patchelf 是 **0.19.1**, 实测产物能原生直跑:
-#   0.19.2 (bionic)      → 207162576 字节 → rc=139
-#   0.19.1 (glibc, grun) → 207228112 字节 → opencode v2.1.0, rc=0
-# 所以: 先试 bionic 版, 验证不过就上 glibc 版 (native 模式比 proot-bind 快,
-# 且后台服务不会卡在退出)。
+# ---------- 私有 musl loader + DNS shim ----------
+# musl 的解析器把 "/etc/resolv.conf" 编译死在 loader 里, 而 Android 的 /etc
+# 是只读的 /system/etc, 没有该文件 → 回退 127.0.0.1:53 并超时。无 root 又不能
+# 监听 53 端口, 所以只改路径: 在 app 私有目录放一份 loader 副本, 把字符串
+# 原地替换成 /sdcard/.oc-resolv (字符串后有 6 个 NUL 填充字节, 最长 22 字符;
+# app 私有目录的路径都超过这个长度, 所以只能选 /sdcard)。系统 loader 不动。
+sync_resolv_shim() {
+    [ -f "$RESOLV_SRC" ] || return 0
+    cmp -s "$RESOLV_SRC" "$RESOLV_SHIM" 2>/dev/null && return 0
+    cp -f "$RESOLV_SRC" "$RESOLV_SHIM" 2>/dev/null || return 1
+}
 
-GLIBC_PATCHELF="$PREFIX/glibc/bin/patchelf"
+ensure_musl_loader() {
+    local src="$INTERP" off
+    [ -f "$src" ] || { warn "找不到 musl loader: $src"; return 1; }
+    mkdir -p "$OPENCODE_DIR"
 
-# 确保 glibc 版 patchelf 可用 (需要 grun + patchelf-glibc + glibc 环境)。
-# 返回 0 表示可用。首次安装会下载约 33MB、占用约 214MB 磁盘。
-install_glibc_patchelf() {
-    if command -v grun >/dev/null 2>&1 && [ -x "$GLIBC_PATCHELF" ]; then
-        return 0
+    # 系统 loader 升级后自动重建私有副本
+    if [ -f "$MUSL_LOADER" ] && \
+       [ "$(sha256sum "$MUSL_LOADER" 2>/dev/null | cut -d' ' -f1)" != "$(sha256sum "$src" | cut -d' ' -f1)" ]; then
+        rm -f "$MUSL_LOADER"
     fi
-    info "安装 glibc 版 patchelf (0.19.1, 能正确处理该二进制)…"
-    info "提示: 需下载约 33MB、占用约 214MB 磁盘, 首次会慢一些"
-    pkg install -y patchelf-glibc glibc glibc-runner gcc-libs-glibc >/dev/null 2>&1 || true
-    command -v grun >/dev/null 2>&1 && [ -x "$GLIBC_PATCHELF" ]
+    if [ ! -f "$MUSL_LOADER" ]; then
+        cp -f "$src" "$MUSL_LOADER" || return 1
+        chmod 755 "$MUSL_LOADER"
+        off=$(grep -aboF '/etc/resolv.conf' "$MUSL_LOADER" | head -1 | cut -d: -f1)
+        [ -n "$off" ] || { rm -f "$MUSL_LOADER"; warn "loader 里找不到 /etc/resolv.conf 字符串"; return 1; }
+        printf '%s\0' "$RESOLV_SHIM" | dd of="$MUSL_LOADER" bs=1 seek="$off" conv=notrunc 2>/dev/null || return 1
+        grep -qaF "$RESOLV_SHIM" "$MUSL_LOADER" || { rm -f "$MUSL_LOADER"; return 1; }
+    fi
+    sync_resolv_shim || warn "写不进 $RESOLV_SHIM (存储权限?), DNS 可能不可用"
+    return 0
 }
 
-glibc_patchelf_version() {
-    grun "$GLIBC_PATCHELF" --version 2>/dev/null | head -1 || echo "版本未知"
-}
-
-# 打补丁 + 验证。$1=二进制 $2=未打补丁的原始副本 $3=bionic|glibc
-# 每次都从原始副本重新打, 保证前一次的产物不会残留。
-# 返回 0 = 补丁后能跑。
+# ---------- patchelf 补丁 ----------
+# 只改 interpreter, 绝对不要 --set-rpath:
+#   rpath + musl + Android 的组合会让这个 206MB 的 Bun 二进制一跑就 SIGSEGV
+#   (exit 139; patchelf 0.19.2 / 0.19.1 都一样)。运行库改由 wrapper 用
+#   LD_LIBRARY_PATH=$RPATH 提供。
+# $1=二进制 $2=未打补丁的原始副本
 patch_and_verify() {
-    local bin="$1" orig="$2" kind="$3"
-    local -a PE=(patchelf)
-    [ "$kind" = "glibc" ] && PE=(grun "$GLIBC_PATCHELF")
-
+    local bin="$1" orig="$2"
     cp -f "$orig" "$bin" || return 1
-    "${PE[@]}" --set-interpreter "$INTERP" "$bin" 2>/dev/null || return 1
-    "${PE[@]}" --set-rpath "$RPATH" "$bin" 2>/dev/null || return 1
-
-    if ! kernel_needs_proot; then
-        env -u LD_PRELOAD "SSL_CERT_FILE=${SSL_CERT_FILE:-$PREFIX/etc/tls/cert.pem}" \
-            "$bin" --version >/dev/null 2>&1 && return 0
-    fi
-    if command -v proot >/dev/null 2>&1; then
-        proot_run "$bin" --version >/dev/null 2>&1 && return 0
-    fi
-    return 1
+    patchelf --set-interpreter "$MUSL_LOADER" "$bin" 2>/dev/null || return 1
+    env -u LD_PRELOAD "LD_LIBRARY_PATH=$RPATH" \
+        "SSL_CERT_FILE=${SSL_CERT_FILE:-$CERT_FILE}" \
+        "$bin" --version >/dev/null 2>&1 || return 1
+    return 0
 }
 
 # ---------- 下载 ----------
@@ -376,33 +386,19 @@ upgrade_packages() {
 
 
 # ---------- 依赖 ----------
+# 原生方案只需要 patchelf (改 interpreter) + nodejs (dns-bootstrap 探测 DNS)。
+# 不需要 root, 也不需要 proot —— proot 只在极端情况下自动兜底。
 install_dependencies() {
     local need=()
     command -v patchelf >/dev/null || need+=(patchelf)
     command -v node >/dev/null || need+=(nodejs-lts)
     command -v npm >/dev/null || need+=(nodejs-lts)
-    # 有 root → dns53 原生方案; 无 root → proot 兜底
-    if command -v sudo >/dev/null 2>&1; then
-        if ! sudo -n true 2>/dev/null; then need+=(proot); fi
-    else
-        need+=(sudo)
-    fi
+    command -v curl >/dev/null || need+=(curl)
     if [ ${#need[@]} -gt 0 ]; then
         info "安装依赖: ${need[*]}"
         pkg install -y "${need[@]}" || fail "依赖安装失败, 请先手动执行 pkg update && pkg upgrade"
     else
         ok "依赖已就绪 (patchelf $(patchelf --version 2>/dev/null | grep -oE '[0-9.]+'), node $(node --version))"
-    fi
-    if ! sudo -n true 2>/dev/null; then
-        if ! command -v proot >/dev/null 2>&1; then
-            info "未检测到 root, 安装 proot 兜底…"
-            pkg install -y proot || true
-        fi
-        # 无 root 时 musl 二进制会被 seccomp 拦截 (Bad system call / Segmentation fault),
-        # 没有 proot 就跑不起来 → 在这里早失败, 别等到验证阶段才段错误。
-        command -v proot >/dev/null 2>&1 \
-            || fail "无 root 环境必须用 proot 才能运行 musl 二进制, 但 proot 安装失败。请手动: pkg install proot"
-        warn "未检测到 root: 将使用 proot 兜底方案 (性能略降)"
     fi
 }
 
@@ -583,9 +579,23 @@ install_opencode() {
     [ -n "$version" ] || fail "无法获取最新版本 (网络问题?)"
     info "最新版本: $version"
 
-    local installed=""
+    # 私有 loader + DNS shim 每次安装都确认一遍 (自愈: 文件被删/系统升级后可恢复)
+    ensure_musl_loader || warn "私有 loader 未就绪, 退回系统 loader (DNS 可能不可用)"
+
+    local installed="" cur_mode=""
     [ -f "$VERSION_FILE" ] && installed=$(cat "$VERSION_FILE" 2>/dev/null || true)
-    if [ -x "$REAL_BIN" ] && [ "$installed" = "$version" ]; then
+    [ -f "$MODE_FILE" ] && cur_mode=$(cat "$MODE_FILE" 2>/dev/null || true)
+    if [ -x "$REAL_BIN" ] && [ "$installed" = "$version" ] && [ "$cur_mode" = "native" ]; then
+        # 已是 native: 顺手确认 interpreter 仍指向私有 loader (老版本装的可能指向系统 loader)
+        if [ -f "$REAL_BIN.orig" ] && \
+           ! patchelf --print-interpreter "$REAL_BIN" 2>/dev/null | grep -qx "$MUSL_LOADER"; then
+            info "二进制 interpreter 不是私有 loader, 重新打补丁…"
+            if patch_and_verify "$REAL_BIN" "$REAL_BIN.orig"; then
+                ok "已重新打补丁 (native)"
+            else
+                warn "重新打补丁失败, 保留现状"
+            fi
+        fi
         ok "已是最新版本 $version, 跳过下载"
         return
     fi
@@ -612,27 +622,27 @@ install_opencode() {
     [ -f "$new_bin" ] || fail "tarball 内未找到 package/bin/opencode"
     chmod +x "$new_bin"
 
-    # 留一份未打补丁的原始二进制 (patchelf 失败时用它)
+    # 留一份未打补丁的原始二进制 (之后的 update/自愈都从它重新打)
     cp "$new_bin" "$work/opencode.orig"
 
-    # 打补丁必须验证: patchelf 0.19.2 退出码为 0 但产物是坏的, 光看返回值
-    # 判断不出来。两种 patchelf 依次尝试, 都不行才退到 proot-bind。
+    # 打补丁必须验证: patchelf 的退出码为 0 也可能产出坏二进制 (历史上 0.19.2
+    # 加 rpath 就会 SIGSEGV), 所以补丁后直接跑 --version。正常路径是原生直跑。
     local mode=native verify_log="$work/verify.log"
-    if patch_and_verify "$new_bin" "$work/opencode.orig" bionic; then
-        ok "patchelf 补丁验证通过 (bionic $(patchelf --version 2>/dev/null | head -1))"
-    elif install_glibc_patchelf && patch_and_verify "$new_bin" "$work/opencode.orig" glibc; then
-        ok "patchelf 补丁验证通过 (glibc 版 $(glibc_patchelf_version))"
+    if patch_and_verify "$new_bin" "$work/opencode.orig"; then
+        ok "补丁验证通过: 原生直跑, 无需 proot"
     else
-        warn "两种 patchelf 都跑不起来 (0.19.2 会把该二进制改坏)"
-        info "改用 proot 绑定运行库模式 (二进制保持官方原样, 由 proot 把运行库绑到标准路径)"
+        warn "原生直跑失败, 退回 proot 绑定运行库模式"
+        info "二进制保持官方原样 (只把 interpreter 指回系统 loader), 由 proot 绑定运行库"
         if ! command -v proot >/dev/null 2>&1; then
             info "安装 proot…"
             pkg install -y proot || true
         fi
         command -v proot >/dev/null 2>&1 \
-            || fail "该模式需要 proot, 但安装失败。请手动: pkg install proot"
-        new_bin="$work/opencode.orig"
-        chmod +x "$new_bin"
+            || fail "该兜底模式需要 proot, 但安装失败。请手动: pkg install proot"
+        cp -f "$work/opencode.orig" "$work/opencode.proot"
+        patchelf --set-interpreter "$INTERP" "$work/opencode.proot" 2>/dev/null || true
+        chmod +x "$work/opencode.proot"
+        new_bin="$work/opencode.proot"
         mode=proot-bind
         local verify_ok=0
         proot_bind_run "$new_bin" --version >"$verify_log" 2>&1 && verify_ok=1
@@ -647,6 +657,9 @@ install_opencode() {
     mkdir -p "$OPENCODE_DIR"
     mv -f "$new_bin" "$REAL_BIN"
     chmod +x "$REAL_BIN"
+    # 保留未打补丁的原件: 自愈 / 后续 update 需要
+    cp -f "$work/opencode.orig" "$REAL_BIN.orig"
+    chmod +x "$REAL_BIN.orig" 2>/dev/null || true
     echo "$version" > "$VERSION_FILE"
     echo "$mode" > "$MODE_FILE"
     ok "OpenCode $version 已安装 (运行模式: $mode)"
@@ -663,7 +676,11 @@ write_wrapper() {
 #
 # Official OpenCode V2 musl build (npm: @opencode/cli-linux-arm64-musl), patched:
 #   interpreter → Termux musl loader (ld-musl-aarch64.so.1)
-#   rpath       → Termux musl libs (libstdc++, libgcc_s)
+#   运行库       → LD_LIBRARY_PATH=$PREFIX/lib/musl (libstdc++, libgcc_s)
+#
+# 注意: **不要**用 patchelf --set-rpath。bionic patchelf 0.19.2 打 rpath 会
+# 产出退出码 0 但运行时 SIGSEGV 的坏二进制 (实测 exit 139)。只打 interpreter +
+# 设 LD_LIBRARY_PATH 即可, 无需 proot, 也无需 glibc 版 patchelf。
 #
 # Usage:
 #   opencode [args...]          run opencode (patched); 启动前自动
@@ -686,6 +703,13 @@ VERSION_FILE="$BIN_DIR/.version"
 MODE_FILE="$BIN_DIR/.mode"      # native (patchelf) / proot-bind
 INTERP="$PREFIX/lib/ld-musl-aarch64.so.1"
 RPATH="$PREFIX/lib/musl"
+MUSL_LIBS="$PREFIX/lib/musl"     # native 模式的 LD_LIBRARY_PATH
+# DNS: musl 硬编码读 /etc/resolv.conf, Android 上该文件不存在 → 解析回退
+# 127.0.0.1:53 并超时。无 root 造不出 /etc/resolv.conf, 于是用一份私有
+# loader 副本, 把内部硬编码的路径就地改写成 $RESOLV_SHIM (详见 ensure_musl_loader)。
+MUSL_LOADER="$BIN_DIR/ld-musl-aarch64.so.1"   # 私有 loader 副本 (仅 opencode 使用)
+RESOLV_SRC="$PREFIX/etc/resolv.conf"
+RESOLV_SHIM="/sdcard/.oc-resolv"
 # V2 起官方走 npm 分发 (不再是 GitHub Releases)
 NPM_PKG="@opencode/cli-linux-arm64-musl"
 UPDATE_API="https://opencode.ai/update/api/latest/cli/npm"
@@ -776,35 +800,106 @@ refresh_dns_nonroot() {
     fi
 }
 
-# 运行 opencode 二进制。优先级:
-#   1) 内核 >= 5.11 → 必须 proot -k 5.10.0 (Bun epoll_pwait2 会段错误,
-#      这条优先于 root —— 即使有 root, 原生直跑同样会崩)
-#   2) 有 root → 原生直跑
-#   3) 无 root → proot (seccomp 会拦 musl 的系统调用)
+# ---- DNS 兜底 (无 root / 无 proot) --------------------------------------
+# musl 的解析器把 "/etc/resolv.conf" 编译死在 loader 里; Android 的 /etc 是
+# /system/etc 的只读挂载, 没有 resolv.conf。文件打不开时 musl 回退到
+# 127.0.0.1:53, 那里没人监听 → 每次解析都要等超时 (表现为
+# "getaddrinfo ETIMEOUT")。
+#
+# 解法: 复制一份 loader 到私有目录, 把里面那个字符串就地改写成
+# $RESOLV_SHIM —— 该字符串后面正好有 6 字节 NUL 填充, 因此路径最长 22 字符。
+# 所有 app 私有目录都超过 22 字符, /sdcard/.oc-resolv 是唯一够短的可写路径
+# (实测 musl 能正常从 FUSE 读取)。系统 $PREFIX/lib/ld-musl-aarch64.so.1 不动。
+ensure_musl_loader() {
+    local src="$PREFIX/lib/ld-musl-aarch64.so.1" off=""
+    if [ -f "$MUSL_LOADER" ] && grep -qaF "$RESOLV_SHIM" "$MUSL_LOADER"; then return 0; fi
+    [ -f "$src" ] || return 1
+    mkdir -p "$BIN_DIR" 2>/dev/null || return 1
+    cp -f "$src" "$MUSL_LOADER" || return 1
+    off="$(grep -aboF '/etc/resolv.conf' "$MUSL_LOADER" 2>/dev/null | head -1 | cut -d: -f1)"
+    if [ -n "$off" ]; then
+        # 就地覆盖 (不改变文件长度, 否则 ELF 偏移全废)
+        printf '%s\0' "$RESOLV_SHIM" | dd of="$MUSL_LOADER" bs=1 seek="$off" conv=notrunc 2>/dev/null || true
+    fi
+    chmod +x "$MUSL_LOADER" 2>/dev/null || true
+    grep -qaF "$RESOLV_SHIM" "$MUSL_LOADER"
+}
+
+# dns-bootstrap 会在网络切换后重写 $PREFIX/etc/resolv.conf, 同步到 shim 路径。
+sync_resolv_shim() {
+    [ -f "$RESOLV_SRC" ] || return 0
+    cmp -s "$RESOLV_SRC" "$RESOLV_SHIM" && return 0
+    cp -f "$RESOLV_SRC" "$RESOLV_SHIM" 2>/dev/null || true
+}
+
+# 存储权限: DNS shim 放在 /sdcard/.oc-resolv (见 ensure_musl_loader), 需要
+# 共享存储权限。
+# 注意 termux-setup-storage 是两阶段的:
+#   第 1 次 → 只弹 Android 权限窗 (用户点"允许")
+#   第 2 次 → 权限到位后才会在 Termux 里问 "Do you want to continue? (y/n)"
+#            (重建 ~/storage 软链)
+# 两次都用 printf 'y' 喂 stdin, 所以不会像直接调用那样卡在交互提问上。
+ensure_storage_access() {
+    local probe="/sdcard/.oc-write-test.$$" mark="$BIN_DIR/.storage-denied" i age ok=0
+    ( : >"$probe" ) 2>/dev/null && { rm -f "$probe" "$mark" 2>/dev/null; return 0; }
+    # 5 分钟内已经请求过且失败 → 不再重复弹窗/等待, 免得每次启动都卡
+    if [ -f "$mark" ]; then
+        age=$(( $(date +%s) - $(stat -c %Y "$mark" 2>/dev/null || echo 0) ))
+        [ "$age" -lt 300 ] && return 1
+    fi
+    command -v termux-setup-storage >/dev/null 2>&1 || return 1
+    echo "→ 需要存储权限 (DNS 配置放在 $RESOLV_SHIM), 正在请求…" >&2
+    printf 'y\n' | termux-setup-storage >/dev/null 2>&1 || true   # 第 1 次: 弹权限窗
+    for i in $(seq 1 20); do                                       # 等用户点"允许"
+        ( : >"$probe" ) 2>/dev/null && { ok=1; break; }
+        sleep 1
+    done
+    rm -f "$probe" 2>/dev/null
+    if [ "$ok" = 1 ]; then
+        rm -f "$mark" 2>/dev/null
+        # 第 2 次: 权限到位后它才会问 y/n, 顺便把 ~/storage 软链建好
+        printf 'y\n' | termux-setup-storage >/dev/null 2>&1 || true
+        return 0
+    fi
+    mkdir -p "$BIN_DIR" 2>/dev/null && : >"$mark" 2>/dev/null
+    echo "!! 存储权限未授予 → musl 读不到 DNS 配置, 联网会超时。" >&2
+    echo "   请在手机上点“允许”(App 需在前台), 或手动执行: termux-setup-storage" >&2
+    return 1
+}
+
+# 运行 opencode 二进制。
+#   native 模式: 直接跑 (interp 已指向 Termux musl loader, 运行库走
+#                LD_LIBRARY_PATH)。不需要 proot —— 进程能看到真实内核
+#                (6.6.x-...-android...), Bun 会自行禁用有问题的
+#                epoll_pwait2 路径。proot 仅作最后兜底。
+#   proot-bind:  二进制未打补丁, 必须经 proot 把 musl 运行库绑到标准路径;
+#                直接跑会因 /lib/ld-musl-aarch64.so.1 不存在而 ENOENT。
 run_opencode() {
     local bin="$1"; shift
-    local _env="env -u LD_PRELOAD SSL_CERT_FILE=${SSL_CERT_FILE:-$PREFIX/etc/tls/cert.pem}"
-    # proot-bind 模式: 二进制未打补丁, 必须经 proot 把 musl 运行库绑到标准路径;
-    # 直接跑或只走 proot_run 都会因为找不到 interpreter 而失败
-    # (报 "No such file or directory", 其实是 /lib/ld-musl-aarch64.so.1 不存在)
-    if [ "$(cat "$MODE_FILE" 2>/dev/null || echo native)" = "proot-bind" ] \
-       && command -v proot >/dev/null 2>&1; then
+    local _env=(env -u LD_PRELOAD "LD_LIBRARY_PATH=$MUSL_LIBS" \
+                    "SSL_CERT_FILE=${SSL_CERT_FILE:-$PREFIX/etc/tls/cert.pem}")
+    local mode
+    mode="$(cat "$MODE_FILE" 2>/dev/null || echo native)"
+
+    if [ "$mode" = "native" ]; then
+        "${_env[@]}" "$bin" "$@" && return 0
+        if command -v proot >/dev/null 2>&1; then proot_bind_run "$bin" "$@"; return; fi
+        return 1
+    fi
+
+    if command -v proot >/dev/null 2>&1; then
         proot_bind_run "$bin" "$@"
-    elif kernel_needs_proot && command -v proot >/dev/null 2>&1; then
-        proot_run "$bin" "$@"
-    elif command -v sudo >/dev/null 2>&1 && sudo -n true 2>/dev/null; then
-        $_env "$bin" "$@"
-    elif command -v proot >/dev/null 2>&1; then
-        proot_run "$bin" "$@"
     else
-        $_env "$bin" "$@"
+        "${_env[@]}" "$bin" "$@"
     fi
 }
 
-# Bun 编译的二进制在"报告的内核 >= 5.11"时走 epoll_pwait2, 该 syscall 返回
-# ENOSYS 时 Bun 无兜底 → 空指针段错误 (bun#32489), 现象:
-#   proot info: vpid 1: terminated with signal 11
-# 规避: proot -k 5.10.0 把看到的内核降到 5.10 → Bun 退回 epoll_pwait。
+# 历史遗留的兜底判断, 仅供 proot 分支使用。
+# 旧说法: Bun 在"报告的内核 >= 5.11"时走 epoll_pwait2, 返回 ENOSYS 时无兜底
+# → 空指针段错误 (bun#32489), 于是用 proot -k 5.10.0 把内核降到 5.10。
+# 现状 (opencode 2.1.2 / Bun 1.4.2): 该崩溃已无法复现 —— 内置 Bun 含
+# PR #32490 修复 (uname 带 -android 时直接不用 epoll_pwait2), 且本机 seccomp
+# 并未拦截 syscall 441 (返回 EINVAL = 调用成功)。因此 native 模式不再走 proot。
 kernel_needs_proot() {
     local maj min
     maj="$(uname -r | cut -d. -f1 | tr -dc '0-9')"
@@ -901,16 +996,18 @@ patch_and_verify() {
     [ "$kind" = "glibc" ] && PE=(grun "$GLIBC_PATCHELF")
 
     cp -f "$orig" "$bin" || return 1
-    "${PE[@]}" --set-interpreter "$INTERP" "$bin" 2>/dev/null || return 1
-    "${PE[@]}" --set-rpath "$RPATH" "$bin" 2>/dev/null || return 1
+    # 只打 interpreter。**不要加 --set-rpath**: patchelf 0.19.2 在加 rpath 时
+    # 会写出运行时 SIGSEGV 的坏文件 (退出码却是 0)。运行库改用 LD_LIBRARY_PATH。
+    # interpreter 指向私有 loader 副本 (它读 /sdcard/.oc-resolv, 见上)。
+    ensure_musl_loader 2>/dev/null || true
+    local interp="$MUSL_LOADER"
+    [ -f "$interp" ] || interp="$INTERP"
+    "${PE[@]}" --set-interpreter "$interp" "$bin" 2>/dev/null || return 1
 
-    if ! kernel_needs_proot; then
-        env -u LD_PRELOAD "SSL_CERT_FILE=${SSL_CERT_FILE:-$PREFIX/etc/tls/cert.pem}" \
-            "$bin" --version >/dev/null 2>&1 && return 0
-    fi
-    if command -v proot >/dev/null 2>&1; then
-        proot_run "$bin" --version >/dev/null 2>&1 && return 0
-    fi
+    # 验证 = 原生直跑(不经 proot), 这才代表真正可用
+    env -u LD_PRELOAD "LD_LIBRARY_PATH=$MUSL_LIBS" \
+        "SSL_CERT_FILE=${SSL_CERT_FILE:-$PREFIX/etc/tls/cert.pem}" \
+        "$bin" --version >/dev/null 2>&1 && return 0
     return 1
 }
 
@@ -938,17 +1035,18 @@ do_update() {
     # 留一份未打补丁的原始二进制
     cp "$NEW_BIN" "$TMP/opencode.orig" || return 1
 
-    # 打补丁必须验证: patchelf 0.19.2 退出码是 0 但产物是坏的。
-    # 即使是 proot-bind 模式也要再试一次 —— glibc 版 patchelf 0.19.1 能修好,
-    # 成功后即可回到 native 模式 (更快, 且后台服务不会卡在退出)。
+    # 打补丁必须验证: patchelf 退出码 0 不代表产物可运行。
+    # 现在只打 interpreter (rpath 会让 0.19.2 产出 SIGSEGV 的坏文件),
+    # 运行库由 LD_LIBRARY_PATH 提供, 因此 bionic patchelf 即可胜任。
+    # glibc 分支保留作最后手段。
     local mode=native
-    echo "==> 打补丁: interpreter + rpath …"
+    echo "==> 打补丁: interpreter (运行库走 LD_LIBRARY_PATH) …"
     if patch_and_verify "$NEW_BIN" "$TMP/opencode.orig" bionic; then
-        echo "==> 补丁验证通过 (bionic patchelf)"
+        echo "==> 补丁验证通过 (bionic patchelf, 原生直跑 OK)"
     elif install_glibc_patchelf && patch_and_verify "$NEW_BIN" "$TMP/opencode.orig" glibc; then
         echo "==> 补丁验证通过 (glibc 版 patchelf $(grun "$GLIBC_PATCHELF" --version 2>/dev/null | head -1))"
     else
-        echo "!! 两种 patchelf 都跑不起来 (0.19.2 会把该二进制改坏)" >&2
+        echo "!! 补丁后的二进制无法原生运行" >&2
         echo "==> 改用 proot 绑定运行库模式…" >&2
         if ! command -v proot >/dev/null 2>&1; then
             pkg install -y proot >/dev/null 2>&1 || true
@@ -964,6 +1062,9 @@ do_update() {
         fi
     fi
 
+    # 保留这一版未打补丁的原件 (回滚 / 重新打补丁时用), 否则每次升级后
+    # opencode.orig 还停留在旧版本
+    cp -f "$TMP/opencode.orig" "$REAL_BIN.orig" 2>/dev/null || true
     mv -f "$NEW_BIN" "$REAL_BIN" || return 1
     chmod +x "$REAL_BIN"
     echo "$VERSION" > "$VERSION_FILE"
@@ -994,6 +1095,10 @@ case "${1:-}" in
     *)
         # 无 root: resolv.conf 会随网络切换过期, 定期(5 分钟)重测重写
         refresh_dns_nonroot
+        # musl 实际读的是 /sdcard/.oc-resolv (见 ensure_musl_loader), 先保证它存在且最新
+        ensure_musl_loader 2>/dev/null || true
+        ensure_storage_access || true
+        sync_resolv_shim
         # 自动更新: 启动前快速检查最新版本 (短超时, 网络差时静默跳过),
         # 非最新则自动更新; 更新失败不阻塞, 用现有版本启动。
         if [ "${OPENCODE_NO_AUTO_UPDATE:-0}" != "1" ]; then
@@ -1035,7 +1140,14 @@ case "${1:-}" in
                 fi
                 ;;
         esac
-        if [ "$RUN_MODE" = "proot-bind" ] && command -v proot >/dev/null 2>&1; then
+        if [ "$RUN_MODE" = "native" ]; then
+            # 原生直跑: interp 已指向 Termux musl loader, 运行库走 LD_LIBRARY_PATH。
+            # 没有 proot 层 → 进程能看到真实内核 (6.6.x-...-android...),
+            # Bun 会自行禁用有问题的 epoll_pwait2 (见 kernel_needs_proot 注释)。
+            exec env -u LD_PRELOAD "LD_LIBRARY_PATH=$MUSL_LIBS" \
+                "SSL_CERT_FILE=${SSL_CERT_FILE:-$PREFIX/etc/tls/cert.pem}" \
+                "$REAL_BIN" "$@"
+        elif [ "$RUN_MODE" = "proot-bind" ] && command -v proot >/dev/null 2>&1; then
             # 未打补丁的官方二进制: 靠 proot 把运行库绑到标准路径
             OSOPT=()
             if kernel_needs_proot; then
@@ -1102,10 +1214,17 @@ WRAPPER_EOF
 
 # ---------- 验证 ----------
 verify() {
-    local ver
-    ver=$(PATH="$HOME_DIR/.local/bin:$PATH" "$WRAPPER_PATH" --version 2>/dev/null) \
+    local ver mode
+    ver=$(OPENCODE_NO_AUTO_UPDATE=1 PATH="$HOME_DIR/.local/bin:$PATH" "$WRAPPER_PATH" --version 2>/dev/null) \
         || fail "验证失败: opencode 无法运行"
-    ok "安装成功: $ver"
+    mode=$(cat "$MODE_FILE" 2>/dev/null || echo unknown)
+    ok "安装成功: $ver (运行模式: $mode)"
+    if [ "$mode" = "native" ]; then
+        [ -f "$MUSL_LOADER" ] && ok "私有 musl loader: $MUSL_LOADER" \
+            || warn "私有 musl loader 缺失, DNS 可能不可用"
+        [ -s "$RESOLV_SHIM" ] && ok "DNS 配置: $RESOLV_SHIM" \
+            || warn "DNS shim 缺失 ($RESOLV_SHIM), 联网可能超时"
+    fi
 }
 
 # ---------- 卸载 ----------
@@ -1113,6 +1232,7 @@ uninstall() {
     warn "将卸载 OpenCode 并移除 wrapper…"
     rm -f "$WRAPPER_PATH"
     rm -rf "$OPENCODE_DIR"
+    rm -f "$RESOLV_SHIM"
     if [ -d "$HOME_DIR/.opencode/bin" ]; then
         rm -f "$HOME_DIR/.opencode/bin/opencode"
     fi
@@ -1146,6 +1266,45 @@ show_guide() {
     echo "=============================================================="
 }
 
+# ---------- 共享存储权限 ----------
+# 无 root 时 DNS 兜底依赖 /sdcard/.oc-resolv (musl 只认 loader 里编译死的路径,
+# 而 app 私有目录的路径都超过 22 字符的字符串上限, 只有 /sdcard 够短)。
+# 所以安装阶段就要拿到共享存储权限。
+#
+# termux-setup-storage 是两阶段的, 必须调两次:
+#   第 1 次 → 只弹 Android 权限窗 (用户点"允许")
+#   第 2 次 → 权限到位后才会在 Termux 里问 "Do you want to continue? (y/n)"
+#            (重建 ~/storage 软链)
+# 两次都用 printf 'y' 喂 stdin, 避免脚本卡在交互提问上。
+ensure_storage_permission() {
+    local probe="/sdcard/.oc-write-test.$$" i ok=0
+    if ( : >"$probe" ) 2>/dev/null; then
+        rm -f "$probe" 2>/dev/null
+        ok "存储权限已就绪"
+        return 0
+    fi
+    if ! command -v termux-setup-storage >/dev/null 2>&1; then
+        warn "缺少 termux-setup-storage, 跳过存储权限检查"
+        return 1
+    fi
+    info "需要存储权限 (DNS 配置放在 /sdcard/.oc-resolv), 请在手机上点“允许”…"
+    printf 'y\n' | termux-setup-storage >/dev/null 2>&1 || true
+    for i in $(seq 1 60); do
+        ( : >"$probe" ) 2>/dev/null && { ok=1; break; }
+        sleep 1
+    done
+    rm -f "$probe" 2>/dev/null
+    if [ "$ok" = 1 ]; then
+        # 第 2 次: 权限到位后才会问 y/n, 顺便把 ~/storage 软链建好
+        printf 'y\n' | termux-setup-storage >/dev/null 2>&1 || true
+        ok "存储权限已授予"
+        return 0
+    fi
+    warn "未获得存储权限: 继续安装, 但 opencode 联网时 DNS 会超时"
+    warn "  请在手机上允许 Termux 的存储权限, 或手动执行 termux-setup-storage"
+    return 1
+}
+
 # ---------- 主流程 ----------
 case "${1:-}" in
     --uninstall) uninstall ;;
@@ -1153,6 +1312,7 @@ esac
 
 info "opencode-termux 安装脚本 — 仅支持 Termux aarch64"
 check_environment
+ensure_storage_permission || true
 fix_mirror
 upgrade_packages
 install_dependencies

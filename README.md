@@ -118,6 +118,7 @@ DNS 兜底不再写进任何 agent 目录(旧版放在 `~/.local/bin` / `~/.code
 ├── check_dns.sh        # 一键诊断
 ├── dns53-aaaa          # AAAA 屏蔽开关: on|off|status
 ├── install.sh          # 安装/升级器
+├── root.sh             # root 后端探测 (sudo / su)
 ├── VERSION             # 组件版本
 └── logs/               # dns53.log / dns-bootstrap.log
 ```
@@ -128,6 +129,25 @@ DNS 兜底不再写进任何 agent 目录(旧版放在 `~/.local/bin` / `~/.code
 - 卸载(只删组件,不动 agent 目录): `bash ~/.local/share/dns53/install.sh --uninstall`
 - AAAA 开关: `bash ~/.local/share/dns53/dns53-aaaa off`
 - 版本保护: 安装器默认拒绝用旧版本覆盖新版本,`--force` 可强制。
+
+### root 判定
+
+dns53 需要 root 才能监听 `127.0.0.1:53`。Android 上**有 root 不等于装了 Termux 的 `sudo` 包**
+(Magisk / KernelSU 只提供 `su`),所以判定按能力顺序进行,并缓存结果:
+
+| 顺序 | 条件 | 执行方式 |
+|---|---|---|
+| 1 | `id -u` 为 0 | 直接执行 |
+| 2 | `sudo -n true` 成功 | `sudo -n`(不弹窗) |
+| 3 | `su -c 'id -u'` 返回 0 | `su -c` |
+| 4 | 都不满足 | 无 root → `dns-bootstrap` |
+
+探测结果缓存在 `~/.local/share/dns53/.root_mode`(`direct|sudo|su|none`),避免每次开 shell
+都去探测 `su` 触发授权弹窗。root 状态变化后,重跑 `bash ~/.local/share/dns53/install.sh --status`
+会重新探测并更新缓存。
+
+> `su -c` 首次会弹 Magisk/KernelSU 授权框,授权一次(建议选"永久")后不再弹。
+> 不想看到弹窗也可以 `pkg install sudo`,走第 2 条。
 
 ## 历史会话在哪
 

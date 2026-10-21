@@ -522,7 +522,7 @@ DNS53_RAW_BASES=(
     "https://cdn.jsdelivr.net/gh/xkxxs/opencode-termux@main/dns53"
     "https://raw.githubusercontent.com/xkxxs/opencode-termux/main/dns53"
 )
-DNS53_FILES=(install.sh VERSION dns53.js dns-bootstrap.js dnsq.js check_dns.sh dns53-aaaa)
+DNS53_FILES=(install.sh VERSION root.sh dns53.js dns-bootstrap.js dnsq.js check_dns.sh dns53-aaaa)
 
 fetch_dns53_payload() {
     local dst="$1" base f all
@@ -717,6 +717,21 @@ UPDATE_API="https://opencode.ai/update/api/latest/cli/npm"
 DNS53_DIR="${XDG_DATA_HOME:-$HOME_DIR/.local/share}/dns53"
 DNS_BOOT="$DNS53_DIR/dns-bootstrap.js"
 
+# root 判定: 有 root 不等于装了 Termux 的 sudo 包 (Magisk/KernelSU 只提供 su)。
+# dns53 安装器探测后会把模式 (direct|sudo|su|none) 缓存到 $DNS53_DIR/.root_mode,
+# 这里优先读缓存, 避免每次启动都探测 su 而触发授权弹窗; 缓存缺失时才退回 sudo -n。
+root_available() {
+    local mode
+    mode="$(cat "$DNS53_DIR/.root_mode" 2>/dev/null || true)"
+    if [ -n "$mode" ]; then
+        [ "$mode" != "none" ]
+        return
+    fi
+    [ "$(id -u 2>/dev/null)" = "0" ] && return 0
+    command -v sudo >/dev/null 2>&1 && sudo -n true 2>/dev/null && return 0
+    return 1
+}
+
 export SSL_CERT_FILE="${SSL_CERT_FILE:-$PREFIX/etc/tls/cert.pem}"
 # V2 自带自动更新: 它会下载官方原始二进制直接替换, 而那份没有经过
 # patchelf (interpreter 还是 /lib/ld-musl-aarch64.so.1) → 在 Termux 上又跑不起来。
@@ -786,7 +801,7 @@ download_asset() {
 refresh_dns_nonroot() {
     [ -f "$DNS_BOOT" ] || return 0
     command -v node >/dev/null 2>&1 || return 0
-    if command -v sudo >/dev/null 2>&1 && sudo -n true 2>/dev/null; then return 0; fi
+    if root_available; then return 0; fi
     local conf="$PREFIX/etc/resolv.conf" now mt
     now=$(date +%s)
     if [ -f "$conf" ]; then
@@ -1176,7 +1191,7 @@ case "${1:-}" in
             else
                 exec proot -k 5.10.0 "${OSOPT[@]}" "$REAL_BIN" "$@"
             fi
-        elif command -v sudo >/dev/null 2>&1 && sudo -n true 2>/dev/null; then
+        elif root_available; then
             exec "$REAL_BIN" "$@"
         elif command -v proot >/dev/null 2>&1; then
             if [ -f "${PREFIX}/etc/resolv.conf" ]; then

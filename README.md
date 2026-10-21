@@ -16,7 +16,7 @@ V1 的适配已归档到 [OpenCodeV1-Termux](https://github.com/xkxxs/OpenCodeV1
 | `opencode` 二进制 | npm `@opencode/cli-linux-arm64-musl` | 动态链接 musl (非静态),不能直接跑 |
 | `ld-musl-aarch64.so.1` | Alpine musl 包 | patchelf 设为 interpreter |
 | `libstdc++.so.6` + `libgcc_s.so.1` | Alpine latest-stable 包 | patchelf 设为 rpath (`$PREFIX/lib/musl`) |
-| DNS | dns53 转发器 / dns-bootstrap | Android 无 `/etc/resolv.conf`,musl 解析器回退 127.0.0.1:53 无人监听 → 卡死 5s |
+| DNS | `dns53/` 独立组件 | 装在 `~/.local/share/dns53`,与任何 agent 目录解耦;Android 无 `/etc/resolv.conf`,musl 解析器回退 127.0.0.1:53 无人监听 → 卡死 5s |
 
 **下载走 npm**:先用 `npm view ... dist.tarball` 解析真实 URL (**跟随你配置的 registry**,
 比如配了 npmmirror 就直接走它),再 `curl --progress-bar` 下载;失败自动换另一个镜像。
@@ -54,7 +54,7 @@ bash <(curl -fsSL https://gh-proxy.com/https://raw.githubusercontent.com/xkxxs/o
 | 环境检查 | 仅支持 Termux + aarch64 |
 | 依赖安装 | `pkg install patchelf nodejs-lts sudo/proot` (有 root 装 sudo, 无 root 自动装 proot) |
 | musl 运行库 | 从 Alpine 获取 ld-musl + libstdc++ + libgcc (已存在则跳过) |
-| DNS 修复 | 有 root: dns53 转发器 + `.bashrc` 常驻; 无 root: dns-bootstrap 实测校验 + proot 绑定; `dns53-aaaa on|off|status` 切换 AAAA 屏蔽 |
+| DNS 修复 | 安装独立的 `dns53` 组件到 `~/.local/share/dns53` (不属于任何 agent); 有 root 走 dns53 转发器 + `.bashrc` 常驻, 无 root 走 dns-bootstrap + proot 绑定 |
 | 安装 OpenCode | opencode.ai API 查最新版 (npm view 兜底) → 下载 tarball → patchelf ×2 → 验证 → 换入 |
 | 生成 wrapper | `~/.local/bin/opencode`: 启动前自动查版更新、`opencode update` 完整升级流程、关掉官方自动更新、修复 `~/.opencode/bin` PATH 陷阱 |
 | 验证 | `opencode --version` |
@@ -65,8 +65,8 @@ bash <(curl -fsSL https://gh-proxy.com/https://raw.githubusercontent.com/xkxxs/o
 opencode                     # 启动: 先检查最新版, 非最新自动更新再启动
 opencode update              # 更新到最新版
 opencode update --force      # 已最新也强制重装
-bash ~/.check_dns.sh         # DNS 一键诊断
-node ~/.local/bin/dnsq.js api.deepseek.com   # 单点解析测试
+bash ~/.local/share/dns53/check_dns.sh       # DNS 一键诊断
+node ~/.local/share/dns53/dnsq.js api.deepseek.com   # 单点解析测试
 bash <(curl -fsSL …/install.sh) --uninstall  # 卸载
 ```
 
@@ -74,6 +74,31 @@ bash <(curl -fsSL …/install.sh) --uninstall  # 卸载
 > 官方更新只替换文件、不重跑 patchelf,更新完 interpreter 变回 `/lib/ld-musl-aarch64.so.1` 就跑不起来了。
 > 本 wrapper 已 `export OPENCODE_DISABLE_AUTOUPDATE=1` 关掉官方的自动更新,
 > 并接管了 `update` / `upgrade` 两个子命令,内置完整流程 (查版 → 下载 → patchelf → 验证 → 原子换入)。
+
+## dns53 独立组件
+
+DNS 兜底不再写进任何 agent 目录(旧版放在 `~/.local/bin` / `~/.codex`),而是作为独立组件
+安装在 `~/.local/share/dns53`,codex、opencode 等所有 musl 程序共用同一份。仓库里的
+`dns53/` 是该组件的源码与安装器,主 `install.sh` 只负责获取并调用它。
+
+```
+~/.local/share/dns53/
+├── dns53.js            # 有 root: 本地 53 端口转发器
+├── dns-bootstrap.js    # 无 root: 实测校验后写 resolv.conf
+├── dnsq.js             # 单点解析测试
+├── check_dns.sh        # 一键诊断
+├── dns53-aaaa          # AAAA 屏蔽开关: on|off|status
+├── install.sh          # 安装/升级器
+├── VERSION             # 组件版本
+└── logs/               # dns53.log / dns-bootstrap.log
+```
+
+- 删除 `~/.codex`、`~/.config/opencode` 等 agent 目录**不会**影响 DNS。
+- 安装/升级: `bash ~/.local/share/dns53/install.sh`
+- 查看状态: `bash ~/.local/share/dns53/install.sh --status`
+- 卸载(只删组件,不动 agent 目录): `bash ~/.local/share/dns53/install.sh --uninstall`
+- AAAA 开关: `bash ~/.local/share/dns53/dns53-aaaa off`
+- 版本保护: 安装器默认拒绝用旧版本覆盖新版本,`--force` 可强制。
 
 ## 历史会话在哪
 
@@ -141,7 +166,7 @@ export ANTHROPIC_MODEL=deepseek-v4-flash
 |---|---|---|
 | `cannot execute: required file not found` | 二进制 interpreter 不存在 | 重跑 `bash install.sh` (自动 patchelf) |
 | `Error relocating libtermux-exec-ld-preload.so: __register_atfork` | termux-exec 的 LD_PRELOAD hook (Bionic) 被 musl 加载 | wrapper 已 `unset LD_PRELOAD` |
-| API 请求恰好卡 5s 超时 | DNS 卡死 (musl 读不到 resolv.conf) | dns53/dns-bootstrap 已自动处理; `bash ~/.check_dns.sh` 诊断 |
+| API 请求恰好卡 5s 超时 | DNS 卡死 (musl 读不到 resolv.conf) | dns53/dns-bootstrap 已自动处理; `bash ~/.local/share/dns53/check_dns.sh` 诊断 |
 | `-S: error while loading shared libraries` | Termux 命令在特定 shell 的怪癖 | 用完整路径调用或重登 shell |
 | glibc 版 Segfault | 用错了非 musl 构建 (官方脚本在 Termux 上就会选错) | 本方案写死 musl 变体,不要直接跑官网的 install 脚本 |
 | 更新后突然 `cannot execute: required file not found` | 被官方自动更新替换成了没打补丁的二进制 | wrapper 已关掉官方自动更新; 出问题时重跑 `opencode update --force` |

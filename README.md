@@ -86,6 +86,7 @@ bash <(curl -fsSL https://gh-proxy.com/https://raw.githubusercontent.com/xkxxs/o
 | DNS 修复 | 安装独立的 `dns53` 组件到 `~/.local/share/dns53`;wrapper 启动时同步 `/sdcard/.oc-resolv` |
 | 安装 OpenCode | opencode.ai API 查最新版 (npm view 兜底) → 下载 tarball → **只打 interpreter** → 原生直跑验证 → 换入 |
 | 生成 wrapper | `~/.local/bin/opencode`: 原生直跑、自动查版更新、`opencode update` 完整升级流程、关掉官方自动更新、修复 `~/.opencode/bin` PATH 陷阱 |
+| 写入 PATH | `~/.local/bin` 幂等写入 `~/.bashrc`;默认 shell 是 zsh(或已安装 zsh / 已有 `~/.zshrc`)时同时写入 `~/.zshrc` |
 | 验证 | `opencode --version`,并报告运行模式 / loader / DNS shim |
 
 ## 使用

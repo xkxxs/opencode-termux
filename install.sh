@@ -665,6 +665,26 @@ install_opencode() {
     ok "OpenCode $version 已安装 (运行模式: $mode)"
 }
 
+# ---------- PATH ----------
+# 默认 shell 是 zsh 时不会读 ~/.bashrc, 只写 .bashrc 等于没装进 PATH。
+# 按 $SHELL / 已安装的 zsh / 已有的 .zshrc 判断, 两个 rc 文件都幂等写入。
+ensure_path_rc() {
+    local rc
+    local -a rcs=("$HOME_DIR/.bashrc")
+    if [ "$(basename "${SHELL:-bash}")" = "zsh" ] \
+       || [ -f "$HOME_DIR/.zshrc" ] \
+       || command -v zsh >/dev/null 2>&1; then
+        rcs+=("$HOME_DIR/.zshrc")
+    fi
+    for rc in "${rcs[@]}"; do
+        [ -e "$rc" ] || : > "$rc"
+        if ! grep -q '\.local/bin' "$rc" 2>/dev/null; then
+            echo 'export PATH="$HOME/.local/bin:$PATH"' >> "$rc"
+            info "~/.local/bin 已加入 PATH ($rc)"
+        fi
+    done
+}
+
 # ---------- 启动 wrapper ----------
 write_wrapper() {
     mkdir -p "$HOME_DIR/.local/bin"
@@ -1223,10 +1243,7 @@ esac
 WRAPPER_EOF
     chmod +x "$WRAPPER_PATH"
 
-    if ! grep -q '\.local/bin' "$HOME_DIR/.bashrc" 2>/dev/null; then
-        echo 'export PATH="$HOME/.local/bin:$PATH"' >> "$HOME_DIR/.bashrc"
-        info "~/.local/bin 已加入 PATH (~/.bashrc)"
-    fi
+    ensure_path_rc
 
     # PATH 陷阱: 官方安装脚本 (opencode.ai/install) 创建的 ~/.opencode/bin
     # 排在 PATH 前面, 里面可能是跑不起来的 glibc 版; 换成 wrapper 副本

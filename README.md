@@ -157,7 +157,7 @@ root 模式下 dns53 每 20 秒写一次心跳 `~/.local/share/dns53/.alive`,wra
 - 心跳缺失/过期(dns53 没起来、被杀、53 端口被占) → 自动回退到 `dns-bootstrap`
   实测出的可用上游 DNS,不会因为「有 root 但 dns53 挂了」导致整个 DNS 失效
 
-`.bashrc` 钩子也用同一个心跳判断,不再每次开 shell 都 `su pgrep`。
+`.bashrc` / `.zshrc` 钩子(zsh 用户)也用同一个心跳判断,不再每次开 shell 都 `su pgrep`。
 
 ## 历史会话在哪
 

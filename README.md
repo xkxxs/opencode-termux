@@ -73,6 +73,16 @@ bash <(curl -fsSL https://cdn.jsdelivr.net/gh/xkxxs/opencode-termux@main/install
 bash <(curl -fsSL https://raw.githubusercontent.com/xkxxs/opencode-termux/main/install.sh)
 ```
 
+## 后台保活建议
+
+Android 可能在息屏后杀掉 Termux 进程，导致长任务中断。装完后建议做三件事（不同 ROM 的名称/路径略有差异）：
+
+1. **开发者选项 → 停止限制子进程**：开启（有的机型叫「后台进程限制」，设为「不限制」）。
+2. **关闭 Termux 的电池优化**：设置 → 应用 → Termux → 电池 → 选「不优化」。
+3. **后台活动设为无限制**：应用信息 → 电池 → 「无限制」，并允许「自启动 / 后台运行」。
+
+MIUI/HyperOS、ColorOS、OriginOS 等定制系统的入口名称不同，按上面的关键词找即可。
+
 ## 脚本做了什么
 
 | 步骤 | 说明 |

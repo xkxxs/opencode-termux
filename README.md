@@ -73,7 +73,10 @@ bash <(curl -fsSL https://cdn.jsdelivr.net/gh/xkxxs/opencode-termux@main/install
 bash <(curl -fsSL https://raw.githubusercontent.com/xkxxs/opencode-termux/main/install.sh)
 ```
 
-> **安装完成后请退出 Termux 并重新打开，或新开一个会话**，让 PATH 和环境变量生效。
+> **安装完成后当前会话就能直接用 `opencode`**：脚本会创建 `$PREFIX/bin/opencode` 指向
+> `~/.local/bin/opencode`（持久软链，重启后仍在）。若仍提示找不到命令，执行
+> `exec $SHELL -l` 或新开一个会话；**仅把 Termux 切到后台再点开不算新会话**，
+> 不会重读 `.bashrc`。
 
 ## 后台保活建议
 
@@ -97,7 +100,7 @@ MIUI/HyperOS、ColorOS、OriginOS 等定制系统的入口名称不同，按上�
 | DNS 修复 | 安装独立的 `dns53` 组件到 `~/.local/share/dns53`;wrapper 启动时同步 `/sdcard/.oc-resolv` |
 | 安装 OpenCode | opencode.ai API 查最新版 (npm view 兜底) → 下载 tarball → **只打 interpreter** → 原生直跑验证 → 换入 |
 | 生成 wrapper | `~/.local/bin/opencode`: 原生直跑、自动查版更新(默认 6 小时节流)、`opencode update`、`--rollback`、`self-update`、`opencode-shared`、关掉官方自动更新、修复 `~/.opencode/bin` PATH 陷阱 |
-| 写入 PATH | `~/.local/bin` 幂等写入 `~/.bashrc`;默认 shell 是 zsh(或已安装 zsh / 已有 `~/.zshrc`)时同时写入 `~/.zshrc` |
+| 写入 PATH | `~/.local/bin` 幂等写入 `~/.bashrc`;默认 shell 是 zsh(或已安装 zsh / 已有 `~/.zshrc`)时同时写入 `~/.zshrc`;并创建持久软链 `$PREFIX/bin/opencode → ~/.local/bin/opencode`, 当前会话立即可用(同名文件会先备份) |
 | 验证 | `opencode --version`,并报告运行模式 / loader / DNS shim |
 
 ## 使用
@@ -290,6 +293,7 @@ export ANTHROPIC_MODEL=deepseek-v4-flash
 | 更新后突然 `cannot execute: required file not found` | 被官方自动更新替换成了没打补丁的二进制 | wrapper 已关掉官方自动更新; 出问题时重跑 `opencode update --force` |
 | `opencode` 启动后一直用 proot / 很慢 | 落到了 proot-bind 兜底模式 | `cat ~/.local/opencode/.mode`;重跑 `opencode update --force` 或 `bash install.sh` 回到 native |
 | V1 的会话历史 | V2 会迁移 V1 数据 | 默认共用 `~/.local/share/opencode`,升级后历史仍在 |
+| 装了以后当前会话仍提示 `opencode: command not found` | 当前 shell 还没读到新的 `.bashrc` (仅切后台不算新会话) | 正常安装已建 `$PREFIX/bin/opencode` 软链, 应立即可用; 否则 `exec $SHELL -l` 或新开会话, 也可 `bash install.sh` 重跑补上链接 |
 
 ## V1 → V2
 

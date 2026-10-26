@@ -37,7 +37,7 @@ PREFIX="${PREFIX:-/data/data/com.termux/files/usr}"
 HOME_DIR="${HOME:-/data/data/com.termux/files/home}"
 # 安装脚本自身版本: 每次改本脚本时递增, 并同步仓库根目录的 VERSION 文件。
 # wrapper 用它判断"脚本是否有更新" (只提示, 不自动执行, 见下)。
-SCRIPT_VERSION="2026.10.26.1"
+SCRIPT_VERSION="2026.10.26.2"
 OPENCODE_DIR="$HOME_DIR/.local/opencode"
 REAL_BIN="$OPENCODE_DIR/opencode"
 VERSION_FILE="$OPENCODE_DIR/.version"
@@ -703,6 +703,43 @@ ensure_path_rc() {
             info "~/.local/bin 已加入 PATH ($rc)"
         fi
     done
+}
+
+# $PREFIX/bin 默认就在 PATH 里, 且不受"当前 shell 是否重读 rc"影响。
+# 在这里放一个指向 wrapper 的软链, 首次安装后**已开着的会话**也能直接
+# 运行 opencode, 不必退出 Termux 重开。
+#
+# 链接本身是持久文件: 重启 Termux / 重启手机都还在, 只有卸载、手动删除、
+# 清除 Termux 数据才会消失。$PREFIX/bin 若被别的同名文件占用, 先备份再替换。
+link_prefix_bin() {
+    local link="$PREFIX/bin/opencode" backup="$PREFIX/bin/opencode.pre-opencode-termux.bak"
+    local target=""
+
+    [ -d "$PREFIX/bin" ] || return 0
+
+    if [ -L "$link" ]; then
+        target="$(readlink -f "$link" 2>/dev/null || true)"
+        if [ "$target" = "$(readlink -f "$WRAPPER_PATH" 2>/dev/null || echo "$WRAPPER_PATH")" ]; then
+            ok "$PREFIX/bin/opencode → ~/.local/bin/opencode"
+            return 0
+        fi
+        warn "$PREFIX/bin/opencode 已指向 $target, 备份为 $(basename "$backup")"
+        mv -f "$link" "$backup" || { warn "备份失败, 跳过 $PREFIX/bin 链接"; return 1; }
+    elif [ -e "$link" ]; then
+        if head -3 "$link" 2>/dev/null | grep -q 'opencode wrapper'; then
+            :   # 旧版 wrapper 副本, 直接替换
+        else
+            warn "$PREFIX/bin/opencode 已被其他程序占用, 备份为 $(basename "$backup")"
+            mv -f "$link" "$backup" || { warn "备份失败, 跳过 $PREFIX/bin 链接"; return 1; }
+        fi
+    fi
+
+    if ln -sfn "$WRAPPER_PATH" "$link" 2>/dev/null; then
+        ok "$PREFIX/bin/opencode → ~/.local/bin/opencode (当前会话立即可用)"
+    else
+        warn "无法创建 $PREFIX/bin/opencode 链接, 新会话中仍可用 (~/.bashrc 已写入 PATH)"
+        return 1
+    fi
 }
 
 # ---------- 启动 wrapper ----------
@@ -1452,6 +1489,7 @@ SHARED_EOF
     chmod +x "$shared_path"
 
     ensure_path_rc
+    link_prefix_bin || true
 
     # PATH 陷阱: 官方安装脚本 (opencode.ai/install) 创建的 ~/.opencode/bin
     # 排在 PATH 前面, 里面可能是跑不起来的 glibc 版; 换成 wrapper 副本
@@ -1477,6 +1515,9 @@ verify() {
         || fail "验证失败: opencode 无法运行"
     mode=$(cat "$MODE_FILE" 2>/dev/null || echo unknown)
     ok "安装成功: $ver (运行模式: $mode)"
+    if [ "$(readlink -f "$PREFIX/bin/opencode" 2>/dev/null)" = "$(readlink -f "$WRAPPER_PATH" 2>/dev/null)" ]; then
+        ok "命令链接: $PREFIX/bin/opencode (当前会话立即可用)"
+    fi
     if [ "$mode" = "native" ]; then
         [ -f "$MUSL_LOADER" ] && ok "私有 musl loader: $MUSL_LOADER" \
             || warn "私有 musl loader 缺失, DNS 可能不可用"
@@ -1488,6 +1529,15 @@ verify() {
 # ---------- 卸载 ----------
 uninstall() {
     warn "将卸载 OpenCode 并移除 wrapper…"
+    # 只删指向本 wrapper 的链接, 不碰其他同名文件; 之前备份过的原文件还原
+    local link="$PREFIX/bin/opencode" backup="$PREFIX/bin/opencode.pre-opencode-termux.bak"
+    if [ -L "$link" ] && [ "$(readlink -f "$link" 2>/dev/null)" = "$(readlink -f "$WRAPPER_PATH" 2>/dev/null)" ]; then
+        rm -f "$link"
+        ok "已移除 $link"
+    fi
+    if [ -e "$backup" ] && [ ! -e "$link" ]; then
+        mv -f "$backup" "$link" && warn "已还原原先的 $link"
+    fi
     rm -f "$WRAPPER_PATH" "$HOME_DIR/.local/bin/opencode-shared"
     rm -rf "$OPENCODE_DIR"
     rm -f "$RESOLV_SHIM"
@@ -1525,7 +1575,9 @@ show_guide() {
     echo "    重跑本脚本即更新           (bash <(curl -fsSL …/install.sh))"
     echo "    重跑本脚本 --uninstall    卸载"
     echo
-    echo "  安装完成后请退出 Termux 重新打开 (或新开一个会话), 让 PATH 生效。"
+    echo "  当前会话即可使用: opencode   (已链接到 $PREFIX/bin/opencode)"
+    echo "  如果仍提示找不到命令: exec \$SHELL -l 或新开一个会话。"
+    echo "  注意: 仅把 Termux 切到后台再点开, 不算新会话, 不会重读 .bashrc。"
     echo
     echo "  建议的 Android 设置 (防止 Termux 被系统杀后台):"
     echo "    1. 开发者选项 → 停止限制子进程: 开启"

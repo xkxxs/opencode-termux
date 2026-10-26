@@ -772,12 +772,13 @@ UPDATE_API="https://opencode.ai/update/api/latest/cli/npm"
 # 安装脚本自身的版本检查: 只拉十几字节的 VERSION, 复用同一个 6 小时节流。
 SCRIPT_VERSION_FILE="$BIN_DIR/.installer-version"
 SCRIPT_VERSION_URLS=(
-    "https://gh-proxy.com/https://raw.githubusercontent.com/xkxxs/opencode-termux/main/VERSION"
+    # gh-proxy 的固定 URL 有几分钟缓存, 加时间戳绕过, 保证新版本立即可见
+    "https://gh-proxy.com/https://raw.githubusercontent.com/xkxxs/opencode-termux/main/VERSION?t=__TS__"
     "https://cdn.jsdelivr.net/gh/xkxxs/opencode-termux@main/VERSION"
     "https://raw.githubusercontent.com/xkxxs/opencode-termux/main/VERSION"
 )
 INSTALLER_URLS=(
-    "https://gh-proxy.com/https://raw.githubusercontent.com/xkxxs/opencode-termux/main/install.sh"
+    "https://gh-proxy.com/https://raw.githubusercontent.com/xkxxs/opencode-termux/main/install.sh?t=__TS__"
     "https://cdn.jsdelivr.net/gh/xkxxs/opencode-termux@main/install.sh"
     "https://raw.githubusercontent.com/xkxxs/opencode-termux/main/install.sh"
 )
@@ -1088,8 +1089,10 @@ mark_update_checked() {
 # 远程安装脚本版本 (仓库根目录 VERSION, 只有十几字节)。
 # 镜像顺序同其它组件: gh-proxy → jsDelivr → raw。
 latest_script_version() {
-    local url v
+    local url v bust
+    bust="$(date +%s)"
     for url in "${SCRIPT_VERSION_URLS[@]}"; do
+        url="${url/__TS__/$bust}"
         v="$(curl -fsSL --connect-timeout 3 --max-time 4 "$url" 2>/dev/null \
             | head -n1 | tr -d '[:space:]')" || v=""
         if [ -n "$v" ]; then
@@ -1111,8 +1114,10 @@ script_version_newer() {
 
 # 下载并运行安装脚本。--yes: 非交互, 跳过 pkg upgrade / 镜像切换 / 存储弹窗。
 run_installer_from_remote() {
-    local url tmp rc
+    local url tmp rc bust
+    bust="$(date +%s)"
     for url in "${INSTALLER_URLS[@]}"; do
+        url="${url/__TS__/$bust}"
         tmp="$(mktemp "${TMPDIR:-$PREFIX/tmp}/opencode-install.XXXXXX" 2>/dev/null)" || continue
         if curl -fsSL --connect-timeout 8 --max-time 90 -o "$tmp" "$url" 2>/dev/null; then
             bash "$tmp" --yes

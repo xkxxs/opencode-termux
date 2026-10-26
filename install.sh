@@ -657,6 +657,17 @@ install_opencode() {
     fi
 
     mkdir -p "$OPENCODE_DIR"
+    # 重装/升级时保留上一版, 供 opencode --rollback 使用
+    if [ -f "$REAL_BIN" ]; then
+        cp -f "$REAL_BIN" "$REAL_BIN.last-good" 2>/dev/null || true
+        chmod +x "$REAL_BIN.last-good" 2>/dev/null || true
+        if [ -f "$VERSION_FILE" ]; then
+            cp -f "$VERSION_FILE" "$VERSION_FILE.last-good" 2>/dev/null || true
+        fi
+        if [ -f "$MODE_FILE" ]; then
+            cp -f "$MODE_FILE" "$MODE_FILE.last-good" 2>/dev/null || true
+        fi
+    fi
     mv -f "$new_bin" "$REAL_BIN"
     chmod +x "$REAL_BIN"
     # 保留未打补丁的原件: 自愈 / 后续 update 需要
@@ -713,7 +724,10 @@ write_wrapper() {
 #                               的那份, 导致再次无法运行)
 #
 # Env:
-#   OPENCODE_NO_AUTO_UPDATE=1   skip auto-update check on startup
+#   OPENCODE_NO_AUTO_UPDATE=1   启动时不检查更新
+#   OPENCODE_UPDATE_CHECK_INTERVAL
+#                               启动检查的最小间隔 (秒, 默认 21600 = 6 小时;
+#                               0 = 每次启动都检查)
 # ============================================================
 set -euo pipefail
 
@@ -723,6 +737,12 @@ BIN_DIR="$HOME_DIR/.local/opencode"
 REAL_BIN="$BIN_DIR/opencode"
 VERSION_FILE="$BIN_DIR/.version"
 MODE_FILE="$BIN_DIR/.mode"      # native (patchelf) / proot-bind
+# 启动检查的节流时间戳: 距上次检查不足间隔就跳过, 避免每次启动都等网络。
+UPDATE_CHECK_STAMP="$BIN_DIR/.last-update-check"
+UPDATE_CHECK_INTERVAL="${OPENCODE_UPDATE_CHECK_INTERVAL:-21600}"
+case "$UPDATE_CHECK_INTERVAL" in
+    ''|*[!0-9]*) UPDATE_CHECK_INTERVAL=21600 ;;
+esac
 INTERP="$PREFIX/lib/ld-musl-aarch64.so.1"
 RPATH="$PREFIX/lib/musl"
 MUSL_LIBS="$PREFIX/lib/musl"     # native 模式的 LD_LIBRARY_PATH
@@ -1021,6 +1041,24 @@ version_ge() {
     [ "$(printf '%s\n%s\n' "$a" "$b" | sort -V | tail -n1)" = "$a" ]
 }
 
+# 启动检查节流: 距上次检查不足 UPDATE_CHECK_INTERVAL 就跳过。
+# 失败也写时间戳 (离线时不会每次启动都卡 10 秒), 需要立即检查可设
+# OPENCODE_UPDATE_CHECK_INTERVAL=0 或 OPENCODE_NO_AUTO_UPDATE=1。
+update_check_due() {
+    local last now
+    last="$(cat "$UPDATE_CHECK_STAMP" 2>/dev/null || echo 0)"
+    case "$last" in
+        ''|*[!0-9]*) last=0 ;;
+    esac
+    now="$(date +%s)"
+    [ $((now - last)) -ge "$UPDATE_CHECK_INTERVAL" ]
+}
+
+mark_update_checked() {
+    mkdir -p "$BIN_DIR" 2>/dev/null || true
+    date +%s >"$UPDATE_CHECK_STAMP" 2>/dev/null || true
+}
+
 GLIBC_PATCHELF="$PREFIX/glibc/bin/patchelf"
 
 # 确保 glibc 版 patchelf (0.19.1) 可用 —— 0.19.2 会把该二进制改坏。
@@ -1056,6 +1094,20 @@ patch_and_verify() {
         "SSL_CERT_FILE=${SSL_CERT_FILE:-$PREFIX/etc/tls/cert.pem}" \
         "$bin" --version >/dev/null 2>&1 && return 0
     return 1
+}
+
+# 回滚到上一次成功安装的二进制 (smoke gate 失败或手动 --rollback)。
+restore_last_good() {
+    [ -f "$REAL_BIN.last-good" ] || return 1
+    cp -f "$REAL_BIN.last-good" "$REAL_BIN" || return 1
+    chmod +x "$REAL_BIN"
+    if [ -f "$VERSION_FILE.last-good" ]; then
+        cp -f "$VERSION_FILE.last-good" "$VERSION_FILE"
+    fi
+    if [ -f "$MODE_FILE.last-good" ]; then
+        cp -f "$MODE_FILE.last-good" "$MODE_FILE"
+    fi
+    return 0
 }
 
 # 下载 → 解压 → 打补丁 → 验证 → 原子换入。失败返回 1 (保留旧二进制)。
@@ -1112,10 +1164,41 @@ do_update() {
     # 保留这一版未打补丁的原件 (回滚 / 重新打补丁时用), 否则每次升级后
     # opencode.orig 还停留在旧版本
     cp -f "$TMP/opencode.orig" "$REAL_BIN.orig" 2>/dev/null || true
+
+    # 换入前保存上一版, 供 smoke gate 失败时回滚
+    if [ -f "$REAL_BIN" ]; then
+        cp -f "$REAL_BIN" "$REAL_BIN.last-good" 2>/dev/null || true
+        chmod +x "$REAL_BIN.last-good" 2>/dev/null || true
+        if [ -f "$VERSION_FILE" ]; then
+            cp -f "$VERSION_FILE" "$VERSION_FILE.last-good" 2>/dev/null || true
+        fi
+        if [ -f "$MODE_FILE" ]; then
+            cp -f "$MODE_FILE" "$MODE_FILE.last-good" 2>/dev/null || true
+        fi
+    fi
+
     mv -f "$NEW_BIN" "$REAL_BIN" || return 1
     chmod +x "$REAL_BIN"
     echo "$VERSION" > "$VERSION_FILE"
     echo "$mode" > "$MODE_FILE"
+
+    # 换入后两道离线 gate: --version 能跑, run --help 退出 0。
+    # 失败直接回滚, 避免留下"看起来装好了但跑不起来"的新版本。
+    local smoke_ok=1
+    if ! run_opencode "$REAL_BIN" --version >/dev/null 2>&1; then
+        smoke_ok=0
+    fi
+    if [ "$smoke_ok" = 1 ] && ! run_opencode "$REAL_BIN" run --help >/dev/null 2>&1; then
+        smoke_ok=0
+    fi
+    if [ "$smoke_ok" != 1 ]; then
+        if restore_last_good; then
+            echo "!! 新版本 smoke test 失败, 已回滚到 $(cat "$VERSION_FILE" 2>/dev/null || echo 未知版本)" >&2
+        else
+            echo "!! 新版本 smoke test 失败, 且没有 last-good 可回滚" >&2
+        fi
+        return 1
+    fi
     echo "✓ 更新完成: $(run_opencode "$REAL_BIN" --version) (模式: $mode)"
 }
 
@@ -1130,6 +1213,7 @@ case "${1:-}" in
         echo "== 检查最新版本 …"
         VERSION="$(latest_version)"
         [ -n "$VERSION" ] || { echo "!! 无法获取最新版本(网络问题?)" >&2; exit 1; }
+        mark_update_checked
 
         CURRENT="$(current_version)"
         if [ "$FORCE" -eq 0 ] && [ -n "$CURRENT" ] && version_ge "$CURRENT" "$VERSION"; then
@@ -1138,6 +1222,14 @@ case "${1:-}" in
         fi
 
         do_update "$VERSION" || exit 1
+        ;;
+    --rollback|rollback)
+        if restore_last_good; then
+            echo "✓ 已回滚到 $(cat "$VERSION_FILE" 2>/dev/null || echo 未知版本)"
+        else
+            echo "!! 没有 last-good 可回滚" >&2
+            exit 1
+        fi
         ;;
     *)
         # 无 root: resolv.conf 会随网络切换过期, 定期(5 分钟)重测重写
@@ -1152,10 +1244,11 @@ case "${1:-}" in
             # dns53 不在 (没起来/已退出): 回退到 dns-bootstrap 实测出的可用上游
             sync_resolv_shim
         fi
-        # 自动更新: 启动前快速检查最新版本 (短超时, 网络差时静默跳过),
-        # 非最新则自动更新; 更新失败不阻塞, 用现有版本启动。
-        if [ "${OPENCODE_NO_AUTO_UPDATE:-0}" != "1" ]; then
+        # 自动更新: 启动前检查最新版本, 但按时间戳节流 (默认 6 小时一次),
+        # 避免每次启动都等 10 秒网络超时; 失败也记时间戳, 离线时不反复卡。
+        if [ "${OPENCODE_NO_AUTO_UPDATE:-0}" != "1" ] && update_check_due; then
             LATEST="$(latest_version 10)" || true
+            mark_update_checked
             if [ -n "$LATEST" ]; then
                 CURRENT="$(current_version)"
                 if [ -z "$CURRENT" ] || ! version_ge "$CURRENT" "$LATEST"; then
@@ -1245,6 +1338,17 @@ esac
 WRAPPER_EOF
     chmod +x "$WRAPPER_PATH"
 
+    # 共享服务入口: 强制 OPENCODE_STANDALONE=0, 不注入 --standalone。
+    # 用法: opencode-shared serve --service & 之后 TUI / opencode-shared run 连它。
+    local shared_path="$HOME_DIR/.local/bin/opencode-shared"
+    cat > "$shared_path" << 'SHARED_EOF'
+#!/data/data/com.termux/files/usr/bin/bash
+# opencode-shared — 强制共享服务模式 (不注入 --standalone)
+export OPENCODE_STANDALONE=0
+exec "$(dirname "$0")/opencode" "$@"
+SHARED_EOF
+    chmod +x "$shared_path"
+
     ensure_path_rc
 
     # PATH 陷阱: 官方安装脚本 (opencode.ai/install) 创建的 ~/.opencode/bin
@@ -1256,6 +1360,8 @@ WRAPPER_EOF
             fi
             cp "$WRAPPER_PATH" "$HOME_DIR/.opencode/bin/opencode"
             chmod +x "$HOME_DIR/.opencode/bin/opencode"
+            cp "$shared_path" "$HOME_DIR/.opencode/bin/opencode-shared" 2>/dev/null || true
+            chmod +x "$HOME_DIR/.opencode/bin/opencode-shared" 2>/dev/null || true
             info "已同步 wrapper 到 ~/.opencode/bin (PATH 陷阱修复)"
         fi
     fi
@@ -1280,11 +1386,11 @@ verify() {
 # ---------- 卸载 ----------
 uninstall() {
     warn "将卸载 OpenCode 并移除 wrapper…"
-    rm -f "$WRAPPER_PATH"
+    rm -f "$WRAPPER_PATH" "$HOME_DIR/.local/bin/opencode-shared"
     rm -rf "$OPENCODE_DIR"
     rm -f "$RESOLV_SHIM"
     if [ -d "$HOME_DIR/.opencode/bin" ]; then
-        rm -f "$HOME_DIR/.opencode/bin/opencode"
+        rm -f "$HOME_DIR/.opencode/bin/opencode" "$HOME_DIR/.opencode/bin/opencode-shared"
     fi
     ok "已卸载"
     warn "dns53 独立组件已保留 — codex 等其他 musl 程序可能依赖它"
@@ -1309,6 +1415,10 @@ show_guide() {
     echo "    opencode                  启动"
     echo "    opencode update           更新到最新版"
     echo "    opencode update --force   已最新也强制重装"
+    echo "    opencode --rollback       回滚到上一版 (更新失败会自动回滚)"
+    echo "    opencode-shared serve --service &   启动共享服务"
+    echo "    opencode-shared run ...   走共享服务 (不注入 --standalone)"
+    echo "    启动检查默认 6 小时一次; OPENCODE_UPDATE_CHECK_INTERVAL=0 可每次检查"
     echo "    重跑本脚本即更新           (bash <(curl -fsSL …/install.sh))"
     echo "    重跑本脚本 --uninstall    卸载"
     echo

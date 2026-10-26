@@ -96,20 +96,31 @@ MIUI/HyperOS、ColorOS、OriginOS 等定制系统的入口名称不同，按上�
 | 私有 loader | 复制 `ld-musl-aarch64.so.1` 到 `~/.local/opencode/`,把 `/etc/resolv.conf` 改写成 `/sdcard/.oc-resolv` |
 | DNS 修复 | 安装独立的 `dns53` 组件到 `~/.local/share/dns53`;wrapper 启动时同步 `/sdcard/.oc-resolv` |
 | 安装 OpenCode | opencode.ai API 查最新版 (npm view 兜底) → 下载 tarball → **只打 interpreter** → 原生直跑验证 → 换入 |
-| 生成 wrapper | `~/.local/bin/opencode`: 原生直跑、自动查版更新、`opencode update` 完整升级流程、关掉官方自动更新、修复 `~/.opencode/bin` PATH 陷阱 |
+| 生成 wrapper | `~/.local/bin/opencode`: 原生直跑、自动查版更新(默认 6 小时节流)、`opencode update`、`--rollback`、`opencode-shared`、关掉官方自动更新、修复 `~/.opencode/bin` PATH 陷阱 |
 | 写入 PATH | `~/.local/bin` 幂等写入 `~/.bashrc`;默认 shell 是 zsh(或已安装 zsh / 已有 `~/.zshrc`)时同时写入 `~/.zshrc` |
 | 验证 | `opencode --version`,并报告运行模式 / loader / DNS shim |
 
 ## 使用
 
 ```bash
-opencode                     # 启动: 先检查最新版, 非最新自动更新再启动
-opencode update              # 更新到最新版
+opencode                     # 启动: 检查最新版(默认 6 小时一次), 非最新自动更新再启动
+opencode update              # 立即检查并更新到最新版
 opencode update --force      # 已最新也强制重装
+opencode --rollback          # 回滚到上一版 (last-good)
+opencode-shared serve --service &   # 共享服务模式: 起常驻服务
 bash ~/.local/share/dns53/check_dns.sh       # DNS 一键诊断
 node ~/.local/share/dns53/dnsq.js api.deepseek.com   # 单点解析测试
 bash <(curl -fsSL …/install.sh) --uninstall  # 卸载
 ```
+
+启动检查的时间戳写在 `~/.local/opencode/.last-update-check`，默认 **6 小时**内只查一次，
+不会再出现每次启动都等 10 秒的情况；检查失败也计时，离线时不会反复卡住。
+想立即检查用 `OPENCODE_UPDATE_CHECK_INTERVAL=0 opencode`（或直接 `opencode update`），
+完全关闭用 `OPENCODE_NO_AUTO_UPDATE=1 opencode`。
+
+每次更新前会把当前版本保留为 `opencode.last-good`（连同 `.version.last-good` /
+`.mode.last-good`）；换入后自动跑 `--version` 和 `run --help` 两道离线检查，
+任一失败就回滚，不会留下“装好了但跑不起来”的版本。手动回滚：`opencode --rollback`。
 
 > ⚠️ 用 `opencode update` (或 `upgrade`),**不要**让官方自己更新:
 > 官方更新只替换文件、不重跑 patchelf,更新完 interpreter 变回 `/lib/ld-musl-aarch64.so.1` 就跑不起来了。
@@ -218,6 +229,19 @@ opencode --standalone        # 或 OPENCODE_STANDALONE=1 由 wrapper 自动附�
 
 > `native` 模式 (patchelf 正常时) 仍用官方默认的后台服务。若你遇到同样的
 > 退出卡住,加 `OPENCODE_STANDALONE=1` 即可。
+
+### 共享服务
+
+想跨终端复用同一个后台服务时,用 `opencode-shared`(等价于 `OPENCODE_STANDALONE=0`):
+
+```bash
+opencode-shared serve --service &    # 启动常驻服务
+opencode-shared run "..."            # 走共享服务
+opencode-shared                      # TUI 也连这个服务
+```
+
+它只是 wrapper 的一个入口,**不会自动启动**服务;服务没起来时行为和普通 `opencode` 一样。
+Termux 进程被系统杀掉后服务也会退出,重开需要再启动一次。
 
 ## 配置模型 (DeepSeek 等)
 

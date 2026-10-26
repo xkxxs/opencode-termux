@@ -96,7 +96,7 @@ MIUI/HyperOS、ColorOS、OriginOS 等定制系统的入口名称不同，按上�
 | 私有 loader | 复制 `ld-musl-aarch64.so.1` 到 `~/.local/opencode/`,把 `/etc/resolv.conf` 改写成 `/sdcard/.oc-resolv` |
 | DNS 修复 | 安装独立的 `dns53` 组件到 `~/.local/share/dns53`;wrapper 启动时同步 `/sdcard/.oc-resolv` |
 | 安装 OpenCode | opencode.ai API 查最新版 (npm view 兜底) → 下载 tarball → **只打 interpreter** → 原生直跑验证 → 换入 |
-| 生成 wrapper | `~/.local/bin/opencode`: 原生直跑、自动查版更新(默认 6 小时节流)、`opencode update`、`--rollback`、`opencode-shared`、关掉官方自动更新、修复 `~/.opencode/bin` PATH 陷阱 |
+| 生成 wrapper | `~/.local/bin/opencode`: 原生直跑、自动查版更新(默认 6 小时节流)、`opencode update`、`--rollback`、`self-update`、`opencode-shared`、关掉官方自动更新、修复 `~/.opencode/bin` PATH 陷阱 |
 | 写入 PATH | `~/.local/bin` 幂等写入 `~/.bashrc`;默认 shell 是 zsh(或已安装 zsh / 已有 `~/.zshrc`)时同时写入 `~/.zshrc` |
 | 验证 | `opencode --version`,并报告运行模式 / loader / DNS shim |
 
@@ -107,6 +107,7 @@ opencode                     # 启动: 检查最新版(默认 6 小时一次), �
 opencode update              # 立即检查并更新到最新版
 opencode update --force      # 已最新也强制重装
 opencode --rollback          # 回滚到上一版 (last-good)
+opencode self-update         # 更新安装脚本自身 (发现新版时启动会提示)
 opencode-shared serve --service &   # 共享服务模式: 起常驻服务
 bash ~/.local/share/dns53/check_dns.sh       # DNS 一键诊断
 node ~/.local/share/dns53/dnsq.js api.deepseek.com   # 单点解析测试
@@ -121,6 +122,28 @@ bash <(curl -fsSL …/install.sh) --uninstall  # 卸载
 每次更新前会把当前版本保留为 `opencode.last-good`（连同 `.version.last-good` /
 `.mode.last-good`）；换入后自动跑 `--version` 和 `run --help` 两道离线检查，
 任一失败就回滚，不会留下“装好了但跑不起来”的版本。手动回滚：`opencode --rollback`。
+
+### 安装脚本自身的更新
+
+仓库根目录有 `VERSION`，安装时会写到 `~/.local/opencode/.installer-version`。
+启动检查复用同一个 6 小时节流，顺带拉一次这个十几字节的文件；发现新版本只打印一行提示：
+
+```
+⚠ 安装脚本有更新 (2026.10.20.1 → 2026.10.26.1)
+  更新: opencode self-update  (本次仍用当前版本启动)
+```
+
+`opencode self-update` 会按 gh-proxy → jsDelivr → raw 的顺序下载安装脚本，并以 `--yes`
+非交互方式运行（跳过 `pkg upgrade`、镜像切换和存储权限弹窗），装完重新启动生效。
+
+默认**不会**自动执行远程脚本。确实想全自动，可设置：
+
+```bash
+OPENCODE_AUTO_UPDATE_INSTALLER=1 opencode
+```
+
+自动模式的输出写到 `~/.local/opencode/self-update.log`，失败不会阻塞本次启动。
+注意这等于允许无需确认执行远程脚本，仓库或镜像被篡改时风险较高，建议保持默认。
 
 > ⚠️ 用 `opencode update` (或 `upgrade`),**不要**让官方自己更新:
 > 官方更新只替换文件、不重跑 patchelf,更新完 interpreter 变回 `/lib/ld-musl-aarch64.so.1` 就跑不起来了。

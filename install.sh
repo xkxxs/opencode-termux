@@ -6,6 +6,10 @@
 # 用法:
 #   bash <(curl -fsSL https://raw.githubusercontent.com/xkxxs/opencode-termux/main/install.sh)
 #   bash <(curl -fsSL …/install.sh) --uninstall
+#   bash <(curl -fsSL …/install.sh) --yes    # 非交互更新 (跳过 pkg upgrade 等)
+#
+# 安装脚本自身也有版本号 (见下方 SCRIPT_VERSION, 需与仓库根目录 VERSION 同步),
+# wrapper 启动时会按 6 小时节流检查脚本更新并提示 opencode self-update。
 #
 # V1 vs V2:
 #   V1 走 GitHub Releases, V2 起官方改用 npm 分发 —— 本仓库跟随 V2;
@@ -31,6 +35,9 @@ set -euo pipefail
 # ---------- 常量 ----------
 PREFIX="${PREFIX:-/data/data/com.termux/files/usr}"
 HOME_DIR="${HOME:-/data/data/com.termux/files/home}"
+# 安装脚本自身版本: 每次改本脚本时递增, 并同步仓库根目录的 VERSION 文件。
+# wrapper 用它判断"脚本是否有更新" (只提示, 不自动执行, 见下)。
+SCRIPT_VERSION="2026.10.26.1"
 OPENCODE_DIR="$HOME_DIR/.local/opencode"
 REAL_BIN="$OPENCODE_DIR/opencode"
 VERSION_FILE="$OPENCODE_DIR/.version"
@@ -700,7 +707,9 @@ ensure_path_rc() {
 
 # ---------- 启动 wrapper ----------
 write_wrapper() {
-    mkdir -p "$HOME_DIR/.local/bin"
+    mkdir -p "$HOME_DIR/.local/bin" "$OPENCODE_DIR"
+    # 记录安装脚本版本, wrapper 用它和远程 VERSION 比对
+    printf '%s\n' "$SCRIPT_VERSION" > "$OPENCODE_DIR/.installer-version"
     cat > "$WRAPPER_PATH" << 'WRAPPER_EOF'
 #!/data/data/com.termux/files/usr/bin/bash
 # ============================================================
@@ -722,12 +731,17 @@ write_wrapper() {
 #   opencode upgrade            同 update (这两个子命令由本 wrapper 接管,
 #                               否则官方会用它自己的二进制覆盖我们打过补丁
 #                               的那份, 导致再次无法运行)
+#   opencode self-update        检查并更新安装脚本自身 (非交互)
+#   opencode --rollback         回滚到上一版 (last-good)
 #
 # Env:
-#   OPENCODE_NO_AUTO_UPDATE=1   启动时不检查更新
+#   OPENCODE_NO_AUTO_UPDATE=1   启动时不检查更新 (含安装脚本更新提示)
 #   OPENCODE_UPDATE_CHECK_INTERVAL
 #                               启动检查的最小间隔 (秒, 默认 21600 = 6 小时;
 #                               0 = 每次启动都检查)
+#   OPENCODE_AUTO_UPDATE_INSTALLER=1
+#                               发现安装脚本更新时自动执行 (默认只提示;
+#                               自动执行意味着无需确认就跑远程脚本, 风险自担)
 # ============================================================
 set -euo pipefail
 
@@ -755,6 +769,18 @@ RESOLV_SHIM="/sdcard/.oc-resolv"
 # V2 起官方走 npm 分发 (不再是 GitHub Releases)
 NPM_PKG="@opencode/cli-linux-arm64-musl"
 UPDATE_API="https://opencode.ai/update/api/latest/cli/npm"
+# 安装脚本自身的版本检查: 只拉十几字节的 VERSION, 复用同一个 6 小时节流。
+SCRIPT_VERSION_FILE="$BIN_DIR/.installer-version"
+SCRIPT_VERSION_URLS=(
+    "https://gh-proxy.com/https://raw.githubusercontent.com/xkxxs/opencode-termux/main/VERSION"
+    "https://cdn.jsdelivr.net/gh/xkxxs/opencode-termux@main/VERSION"
+    "https://raw.githubusercontent.com/xkxxs/opencode-termux/main/VERSION"
+)
+INSTALLER_URLS=(
+    "https://gh-proxy.com/https://raw.githubusercontent.com/xkxxs/opencode-termux/main/install.sh"
+    "https://cdn.jsdelivr.net/gh/xkxxs/opencode-termux@main/install.sh"
+    "https://raw.githubusercontent.com/xkxxs/opencode-termux/main/install.sh"
+)
 # dns53 独立组件 (与 agent 目录解耦)
 DNS53_DIR="${XDG_DATA_HOME:-$HOME_DIR/.local/share}/dns53"
 DNS_BOOT="$DNS53_DIR/dns-bootstrap.js"
@@ -1059,6 +1085,46 @@ mark_update_checked() {
     date +%s >"$UPDATE_CHECK_STAMP" 2>/dev/null || true
 }
 
+# 远程安装脚本版本 (仓库根目录 VERSION, 只有十几字节)。
+# 镜像顺序同其它组件: gh-proxy → jsDelivr → raw。
+latest_script_version() {
+    local url v
+    for url in "${SCRIPT_VERSION_URLS[@]}"; do
+        v="$(curl -fsSL --connect-timeout 3 --max-time 4 "$url" 2>/dev/null \
+            | head -n1 | tr -d '[:space:]')" || v=""
+        if [ -n "$v" ]; then
+            printf '%s' "$v"
+            return 0
+        fi
+    done
+    return 1
+}
+
+# $1=远程版本。本地没有记录 (老安装) 时也返回 0, 提示用户更新一次。
+script_version_newer() {
+    local remote="$1" localv
+    [ -n "$remote" ] || return 1
+    localv="$(cat "$SCRIPT_VERSION_FILE" 2>/dev/null || true)"
+    [ -n "$localv" ] || return 0
+    [ "$remote" != "$localv" ] && version_ge "$remote" "$localv"
+}
+
+# 下载并运行安装脚本。--yes: 非交互, 跳过 pkg upgrade / 镜像切换 / 存储弹窗。
+run_installer_from_remote() {
+    local url tmp rc
+    for url in "${INSTALLER_URLS[@]}"; do
+        tmp="$(mktemp "${TMPDIR:-$PREFIX/tmp}/opencode-install.XXXXXX" 2>/dev/null)" || continue
+        if curl -fsSL --connect-timeout 8 --max-time 90 -o "$tmp" "$url" 2>/dev/null; then
+            bash "$tmp" --yes
+            rc=$?
+            rm -f "$tmp"
+            return "$rc"
+        fi
+        rm -f "$tmp"
+    done
+    return 1
+}
+
 GLIBC_PATCHELF="$PREFIX/glibc/bin/patchelf"
 
 # 确保 glibc 版 patchelf (0.19.1) 可用 —— 0.19.2 会把该二进制改坏。
@@ -1223,6 +1289,21 @@ case "${1:-}" in
 
         do_update "$VERSION" || exit 1
         ;;
+    self-update|--self-update)
+        echo "== 检查安装脚本更新 …"
+        REMOTE_SCRIPT="$(latest_script_version 2>/dev/null || true)"
+        [ -n "$REMOTE_SCRIPT" ] || { echo "!! 无法获取远程版本 (网络问题?)" >&2; exit 1; }
+        LOCAL_SCRIPT="$(cat "$SCRIPT_VERSION_FILE" 2>/dev/null || echo 未知)"
+        echo "  已安装: $LOCAL_SCRIPT / 远程: $REMOTE_SCRIPT"
+        if ! script_version_newer "$REMOTE_SCRIPT"; then
+            echo "✓ 安装脚本已是最新"
+            mark_update_checked
+            exit 0
+        fi
+        run_installer_from_remote || { echo "!! 安装脚本更新失败" >&2; exit 1; }
+        mark_update_checked
+        echo "✓ 安装脚本已更新 (重新启动 opencode 生效)"
+        ;;
     --rollback|rollback)
         if restore_last_good; then
             echo "✓ 已回滚到 $(cat "$VERSION_FILE" 2>/dev/null || echo 未知版本)"
@@ -1258,6 +1339,22 @@ case "${1:-}" in
                     else
                         echo "!! 自动更新失败, 继续使用现有版本启动" >&2
                     fi
+                fi
+            fi
+            # 顺便检查安装脚本自身是否更新。默认只提示, 不自动执行远程脚本。
+            REMOTE_SCRIPT="$(latest_script_version 2>/dev/null || true)"
+            if script_version_newer "$REMOTE_SCRIPT"; then
+                LOCAL_SCRIPT="$(cat "$SCRIPT_VERSION_FILE" 2>/dev/null || echo 未知)"
+                echo "⚠ 安装脚本有更新 ($LOCAL_SCRIPT → $REMOTE_SCRIPT)"
+                if [ "${OPENCODE_AUTO_UPDATE_INSTALLER:-0}" = "1" ]; then
+                    echo "→ 自动更新安装脚本 (日志: $BIN_DIR/self-update.log)…"
+                    if run_installer_from_remote >>"$BIN_DIR/self-update.log" 2>&1; then
+                        echo "✓ 安装脚本已更新 (下次启动生效)"
+                    else
+                        echo "!! 安装脚本自动更新失败, 继续启动" >&2
+                    fi
+                else
+                    echo "  更新: opencode self-update  (本次仍用当前版本启动)"
                 fi
             fi
         fi
@@ -1416,6 +1513,7 @@ show_guide() {
     echo "    opencode update           更新到最新版"
     echo "    opencode update --force   已最新也强制重装"
     echo "    opencode --rollback       回滚到上一版 (更新失败会自动回滚)"
+    echo "    opencode self-update      更新安装脚本自身 (发现新版会提示)"
     echo "    opencode-shared serve --service &   启动共享服务"
     echo "    opencode-shared run ...   走共享服务 (不注入 --standalone)"
     echo "    启动检查默认 6 小时一次; OPENCODE_UPDATE_CHECK_INTERVAL=0 可每次检查"
@@ -1444,6 +1542,7 @@ show_guide() {
 #            (重建 ~/storage 软链)
 # 两次都用 printf 'y' 喂 stdin, 避免脚本卡在交互提问上。
 ensure_storage_permission() {
+    local interactive="${1:-1}"
     local probe="/sdcard/.oc-write-test.$$" i ok=0
     if ( : >"$probe" ) 2>/dev/null; then
         rm -f "$probe" 2>/dev/null
@@ -1452,6 +1551,11 @@ ensure_storage_permission() {
     fi
     if ! command -v termux-setup-storage >/dev/null 2>&1; then
         warn "缺少 termux-setup-storage, 跳过存储权限检查"
+        return 1
+    fi
+    if [ "$interactive" != "1" ]; then
+        warn "非交互模式: 未获得存储权限, 跳过弹窗 (DNS 可能超时)"
+        warn "  请手动允许 Termux 存储权限, 或运行: termux-setup-storage"
         return 1
     fi
     info "需要存储权限 (DNS 配置放在 /sdcard/.oc-resolv), 请在手机上点“允许”…"
@@ -1473,19 +1577,28 @@ ensure_storage_permission() {
 }
 
 # ---------- 主流程 ----------
+NONINTERACTIVE=0
 case "${1:-}" in
     --uninstall) uninstall ;;
+    --yes|-y) NONINTERACTIVE=1 ;;
 esac
 
-info "opencode-termux 安装脚本 — 仅支持 Termux aarch64"
+info "opencode-termux 安装脚本 v$SCRIPT_VERSION — 仅支持 Termux aarch64"
 check_environment
-ensure_storage_permission || true
-fix_mirror
-upgrade_packages
+if [ "$NONINTERACTIVE" = "1" ]; then
+    info "非交互模式: 跳过 pkg upgrade / 镜像切换 / 存储权限弹窗"
+    ensure_storage_permission 0 || true
+else
+    ensure_storage_permission || true
+    fix_mirror
+    upgrade_packages
+fi
 install_dependencies
 install_musl_libs
 install_dns53
 install_opencode
 write_wrapper
 verify
-show_guide
+if [ "$NONINTERACTIVE" != "1" ]; then
+    show_guide
+fi

@@ -97,11 +97,11 @@ MIUI/HyperOS、ColorOS、OriginOS 等定制系统的入口名称不同，按上�
 | 依赖安装 | `pkg install patchelf nodejs-lts curl`(不需要 sudo,也不需要 proot) |
 | musl 运行库 | 从 Alpine 获取 ld-musl + libstdc++ + libgcc (已存在则跳过) |
 | 私有 loader | 复制 `ld-musl-aarch64.so.1` 到 `~/.local/opencode/`,把 `/etc/resolv.conf` 改写成 `/sdcard/.oc-resolv` |
-| DNS 修复 | 安装独立的 `dns53` 组件到 `~/.local/share/dns53`;wrapper 启动时同步 `/sdcard/.oc-resolv` |
+| DNS 修复 | 安装独立的 `dns53` 组件到 `~/.local/share/dns53`;wrapper 启动时同步 `/sdcard/.oc-resolv`;没有存储权限时自动降级到 proot 模式(不依赖 `/sdcard`) |
 | 安装 OpenCode | opencode.ai API 查最新版 (npm view 兜底) → 下载 tarball → **只打 interpreter** → 原生直跑验证 → 换入 |
 | 生成 wrapper | `~/.local/bin/opencode`: 原生直跑、自动查版更新(默认 6 小时节流)、`opencode update`、`--rollback`、`self-update`、`opencode-shared`、关掉官方自动更新、修复 `~/.opencode/bin` PATH 陷阱 |
 | 写入 PATH | `~/.local/bin` 幂等写入 `~/.bashrc`;默认 shell 是 zsh(或已安装 zsh / 已有 `~/.zshrc`)时同时写入 `~/.zshrc`;并创建持久软链 `$PREFIX/bin/opencode → ~/.local/bin/opencode`, 当前会话立即可用(同名文件会先备份) |
-| 验证 | `opencode --version`,并报告运行模式 / loader / DNS shim |
+| 验证 | `opencode --version`,并报告运行模式 / DNS 模式 / loader / DNS shim |
 
 ## 使用
 
@@ -125,6 +125,26 @@ bash <(curl -fsSL …/install.sh) --uninstall  # 卸载
 每次更新前会把当前版本保留为 `opencode.last-good`（连同 `.version.last-good` /
 `.mode.last-good`）；换入后自动跑 `--version` 和 `run --help` 两道离线检查，
 任一失败就回滚，不会留下“装好了但跑不起来”的版本。手动回滚：`opencode --rollback`。
+
+### 存储权限不可用时（DNS 自动降级）
+
+默认方案是用私有 musl loader 直接读 `/sdcard/.oc-resolv`，这需要 Termux 的存储权限。
+拿不到时（用户拒绝、设备限制、或权限后来被收回），wrapper 会**自动**切到 proot 模式：
+
+- 用未打补丁的 `~/.local/opencode/opencode.orig`
+- 由 `proot` 把 `$PREFIX/etc/resolv.conf` 绑到 `/etc/resolv.conf`
+- 全程不依赖 `/sdcard`
+
+细节：
+
+- 每次启动只做一次本地写探测，**不联网、不弹窗**；模式记在 `~/.local/opencode/.dns-mode`
+- 切换时提示一次，之后不刷屏
+- 之后授予存储权限（`termux-setup-storage`），下次启动会**自动切回** sdcard 模式，不需要重装
+- proot 模式默认附加 `--standalone`（该模式下后台服务的客户端退出会卡住）
+- 强制指定：`OPENCODE_DNS_MODE=sdcard|proot|auto`（默认 `auto`）
+
+安装时如果存储权限被拒绝，安装器会自动 `pkg install proot` 并把 DNS 模式设为 `proot`，
+不会再出现“显示安装成功、实际 DNS 不通”的假成功。
 
 ### 安装脚本自身的更新
 
@@ -294,6 +314,7 @@ export ANTHROPIC_MODEL=deepseek-v4-flash
 | `opencode` 启动后一直用 proot / 很慢 | 落到了 proot-bind 兜底模式 | `cat ~/.local/opencode/.mode`;重跑 `opencode update --force` 或 `bash install.sh` 回到 native |
 | V1 的会话历史 | V2 会迁移 V1 数据 | 默认共用 `~/.local/share/opencode`,升级后历史仍在 |
 | 装了以后当前会话仍提示 `opencode: command not found` | 当前 shell 还没读到新的 `.bashrc` (仅切后台不算新会话) | 正常安装已建 `$PREFIX/bin/opencode` 软链, 应立即可用; 否则 `exec $SHELL -l` 或新开会话, 也可 `bash install.sh` 重跑补上链接 |
+| 拒绝存储权限后 `opencode` 联网超时 | 旧版只警告, 生成的 `/sdcard/.oc-resolv` 读不到 | 新版会自动切 proot 模式; 查看 `cat ~/.local/opencode/.dns-mode`, 或 `OPENCODE_DNS_MODE=proot opencode`; 授权后自动切回 |
 
 ## V1 → V2
 

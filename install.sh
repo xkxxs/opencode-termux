@@ -37,7 +37,9 @@ PREFIX="${PREFIX:-/data/data/com.termux/files/usr}"
 HOME_DIR="${HOME:-/data/data/com.termux/files/home}"
 # 安装脚本自身版本: 每次改本脚本时递增, 并同步仓库根目录的 VERSION 文件。
 # wrapper 用它判断"脚本是否有更新" (只提示, 不自动执行, 见下)。
-SCRIPT_VERSION="2026.10.26.2"
+SCRIPT_VERSION="2026.10.26.3"
+# 本次安装选定的 DNS 模式: sdcard (默认) / proot (无存储权限)
+DNS_MODE_DEFAULT="sdcard"
 OPENCODE_DIR="$HOME_DIR/.local/opencode"
 REAL_BIN="$OPENCODE_DIR/opencode"
 VERSION_FILE="$OPENCODE_DIR/.version"
@@ -409,6 +411,18 @@ install_dependencies() {
     fi
 }
 
+# 仅在没有存储权限、需要 DNS 降级时安装 (默认安装不引入 proot)。
+ensure_proot() {
+    command -v proot >/dev/null 2>&1 && return 0
+    info "无存储权限 → 安装 proot 作为 DNS 降级路径…"
+    if pkg install -y proot >/dev/null 2>&1; then
+        ok "proot 已安装"
+        return 0
+    fi
+    warn "proot 安装失败, 无法启用 DNS 降级 (可稍后手动 pkg install proot)"
+    return 1
+}
+
 # ---------- musl 运行库 (Alpine) ----------
 # ---------- Alpine 源: 动态版本 + 多镜像回退 ----------
 # 不能硬编码 apk 版本号: Alpine 的 edge 是滚动分支, 旧版本会被直接轮掉
@@ -588,8 +602,11 @@ install_opencode() {
     [ -n "$version" ] || fail "无法获取最新版本 (网络问题?)"
     info "最新版本: $version"
 
-    # 私有 loader + DNS shim 每次安装都确认一遍 (自愈: 文件被删/系统升级后可恢复)
-    ensure_musl_loader || warn "私有 loader 未就绪, 退回系统 loader (DNS 可能不可用)"
+    # 私有 loader + DNS shim 每次安装都确认一遍 (自愈: 文件被删/系统升级后可恢复)。
+    # 无存储权限走 proot 降级时不需要私有 loader (proot 直接绑定 resolv.conf)。
+    if [ "$DNS_MODE_DEFAULT" = "sdcard" ]; then
+        ensure_musl_loader || warn "私有 loader 未就绪, 退回系统 loader (DNS 可能不可用)"
+    fi
 
     local installed="" cur_mode=""
     [ -f "$VERSION_FILE" ] && installed=$(cat "$VERSION_FILE" 2>/dev/null || true)
@@ -747,6 +764,13 @@ write_wrapper() {
     mkdir -p "$HOME_DIR/.local/bin" "$OPENCODE_DIR"
     # 记录安装脚本版本, wrapper 用它和远程 VERSION 比对
     printf '%s\n' "$SCRIPT_VERSION" > "$OPENCODE_DIR/.installer-version"
+    # 本次安装的 DNS 模式 (运行时仍会自动探测, 权限恢复后切回 sdcard)
+    printf '%s\n' "${DNS_MODE_DEFAULT:-sdcard}" > "$OPENCODE_DIR/.dns-mode"
+    if [ "${DNS_MODE_DEFAULT:-sdcard}" = "proot" ]; then
+        : > "$OPENCODE_DIR/.dns-fallback" 2>/dev/null || true
+    else
+        rm -f "$OPENCODE_DIR/.dns-fallback" 2>/dev/null || true
+    fi
     cat > "$WRAPPER_PATH" << 'WRAPPER_EOF'
 #!/data/data/com.termux/files/usr/bin/bash
 # ============================================================
@@ -779,6 +803,9 @@ write_wrapper() {
 #   OPENCODE_AUTO_UPDATE_INSTALLER=1
 #                               发现安装脚本更新时自动执行 (默认只提示;
 #                               自动执行意味着无需确认就跑远程脚本, 风险自担)
+#   OPENCODE_DNS_MODE=auto      自动 (默认) / sdcard / proot
+#                               没有存储权限时 auto 会切到 proot 模式,
+#                               权限恢复后自动切回 sdcard
 # ============================================================
 set -euo pipefail
 
@@ -788,6 +815,14 @@ BIN_DIR="$HOME_DIR/.local/opencode"
 REAL_BIN="$BIN_DIR/opencode"
 VERSION_FILE="$BIN_DIR/.version"
 MODE_FILE="$BIN_DIR/.mode"      # native (patchelf) / proot-bind
+# DNS 模式: sdcard = 私有 loader 读 /sdcard/.oc-resolv (默认, 需要存储权限)
+#           proot  = 无存储权限时, 用未打补丁的 .orig + proot 绑定
+#                    $PREFIX/etc/resolv.conf
+# 文件只记录"上次实际生效的模式", 每次启动仍会探测, 权限恢复后自动切回。
+DNS_MODE_FILE="$BIN_DIR/.dns-mode"
+# 仅记录"自动降级到 proot"这个事实, 用来在权限恢复时提示一次。
+DNS_FALLBACK_MARK="$BIN_DIR/.dns-fallback"
+DNS_MODE="sdcard"
 # 启动检查的节流时间戳: 距上次检查不足间隔就跳过, 避免每次启动都等网络。
 UPDATE_CHECK_STAMP="$BIN_DIR/.last-update-check"
 UPDATE_CHECK_INTERVAL="${OPENCODE_UPDATE_CHECK_INTERVAL:-21600}"
@@ -998,6 +1033,58 @@ ensure_storage_access() {
     return 1
 }
 
+# ---------- DNS 降级 (无存储权限 → proot) ----------
+# 只做一次本地写探测, 不联网、不弹窗。
+storage_writable() {
+    local probe="/sdcard/.oc-write-test.$$"
+    ( : >"$probe" ) 2>/dev/null || return 1
+    rm -f "$probe" 2>/dev/null || true
+    return 0
+}
+
+# proot 降级需要: 未打补丁的 .orig (系统 loader + /etc/resolv.conf 绑定) 和 proot。
+dns_mode_proot_ready() {
+    [ -x "$REAL_BIN.orig" ] && command -v proot >/dev/null 2>&1
+}
+
+resolve_dns_mode() {
+    case "${OPENCODE_DNS_MODE:-auto}" in
+        sdcard|native) printf 'sdcard' ; return 0 ;;
+        proot)         printf 'proot'  ; return 0 ;;
+    esac
+    if storage_writable; then printf 'sdcard'; else printf 'proot'; fi
+}
+
+# 每次启动调用: 探测 → 切换 → 只在模式变化时提示 (避免每次刷屏)。
+apply_dns_mode() {
+    local pref="${OPENCODE_DNS_MODE:-auto}" want stored
+    want="$(resolve_dns_mode)"
+    DNS_MODE="$want"
+    stored="$(cat "$DNS_MODE_FILE" 2>/dev/null || true)"
+
+    if [ "$want" = "proot" ]; then
+        if [ "$pref" = "auto" ] && [ ! -f "$DNS_FALLBACK_MARK" ]; then
+            mkdir -p "$BIN_DIR" 2>/dev/null || true
+            : >"$DNS_FALLBACK_MARK" 2>/dev/null || true
+            echo "⚠ 存储权限不可用 → DNS 降级为 proot 模式 (不依赖 /sdcard)" >&2
+            echo "  授予权限后会自动切回: termux-setup-storage" >&2
+        fi
+        if [ ! -x "$REAL_BIN.orig" ]; then
+            echo "!! 缺少 $REAL_BIN.orig, 无法降级: 重跑 install.sh 或 opencode update --force" >&2
+        elif ! command -v proot >/dev/null 2>&1; then
+            echo "!! 缺少 proot, 无法降级: pkg install proot" >&2
+        fi
+    elif [ "$pref" = "auto" ] && [ -f "$DNS_FALLBACK_MARK" ]; then
+        rm -f "$DNS_FALLBACK_MARK" 2>/dev/null || true
+        echo "✓ 存储权限已恢复 → DNS 切回 sdcard 模式" >&2
+    fi
+
+    if [ "$want" != "$stored" ]; then
+        mkdir -p "$BIN_DIR" 2>/dev/null || true
+        printf '%s\n' "$want" >"$DNS_MODE_FILE" 2>/dev/null || true
+    fi
+}
+
 # 运行 opencode 二进制。
 #   native 模式: 直接跑 (interp 已指向 Termux musl loader, 运行库走
 #                LD_LIBRARY_PATH)。不需要 proot —— 进程能看到真实内核
@@ -1087,6 +1174,32 @@ proot_bind_run() {
         opts+=(-b "${PREFIX}/etc/resolv.conf:/etc/resolv.conf")
     fi
     proot "${opts[@]}" env -u LD_PRELOAD "SSL_CERT_FILE=${SSL_CERT_FILE:-$PREFIX/etc/tls/cert.pem}" "$bin" "$@"
+}
+
+# 直接 exec 版 (供启动路径使用): 与 proot_bind_run 相同的绑定,
+# 额外用于 DNS 降级模式下的未打补丁二进制。
+proot_bind_exec() {
+    local bin="$1"; shift
+    local opts=() fake=""
+    if kernel_needs_proot; then
+        opts+=(-k 5.10.0)
+        fake="$(fake_osrelease)"
+        if [ -n "$fake" ] && [ -f "$fake" ]; then
+            opts+=(-b "$fake:/proc/sys/kernel/osrelease")
+        fi
+    fi
+    opts+=(-b "${INTERP}:/lib/ld-musl-aarch64.so.1")
+    if [ -f "${RPATH}/libstdc++.so.6" ]; then
+        opts+=(-b "${RPATH}/libstdc++.so.6:/usr/lib/libstdc++.so.6")
+    fi
+    if [ -f "${RPATH}/libgcc_s.so.1" ]; then
+        opts+=(-b "${RPATH}/libgcc_s.so.1:/usr/lib/libgcc_s.so.1")
+    fi
+    if [ -f "${PREFIX}/etc/resolv.conf" ]; then
+        opts+=(-b "${PREFIX}/etc/resolv.conf:/etc/resolv.conf")
+    fi
+    exec proot "${opts[@]}" env -u LD_PRELOAD \
+        "SSL_CERT_FILE=${SSL_CERT_FILE:-$PREFIX/etc/tls/cert.pem}" "$bin" "$@"
 }
 
 # 本地已记录版本; 无记录时从二进制本身探测 (可能为空)
@@ -1355,17 +1468,28 @@ case "${1:-}" in
         fi
         ;;
     *)
-        # 无 root: resolv.conf 会随网络切换过期, 定期(5 分钟)重测重写
+        # 无 root: resolv.conf 会随网络切换过期, 定期(5 分钟)重测重写。
+        # 这一步写的是 $PREFIX/etc/resolv.conf (bionic), 不需要存储权限,
+        # proot 降级模式也依赖它。
         refresh_dns_nonroot
-        # musl 实际读的是 /sdcard/.oc-resolv (见 ensure_musl_loader), 先保证它存在且最新
-        ensure_musl_loader 2>/dev/null || true
-        ensure_storage_access || true
-        if root_available && dns53_alive; then
-            # root + dns53 常驻: 明确指向本地转发器, 避免沿用上次网络残留的上游 DNS
-            printf 'nameserver 127.0.0.1\n' > "$RESOLV_SHIM" 2>/dev/null || true
-        else
-            # dns53 不在 (没起来/已退出): 回退到 dns-bootstrap 实测出的可用上游
-            sync_resolv_shim
+        apply_dns_mode
+        if [ "$DNS_MODE" = "sdcard" ]; then
+            # musl 实际读的是 /sdcard/.oc-resolv (见 ensure_musl_loader), 先保证它存在且最新
+            ensure_musl_loader 2>/dev/null || true
+            # 只有显式要求 sdcard 时才弹权限窗; auto 模式下拿不到就直接用 proot
+            case "${OPENCODE_DNS_MODE:-auto}" in
+                sdcard|native) ensure_storage_access || true ;;
+            esac
+            if root_available && dns53_alive; then
+                # root + dns53 常驻: 明确指向本地转发器, 避免沿用上次网络残留的上游 DNS
+                printf 'nameserver 127.0.0.1\n' > "$RESOLV_SHIM" 2>/dev/null || true
+            else
+                # dns53 不在 (没起来/已退出): 回退到 dns-bootstrap 实测出的可用上游
+                sync_resolv_shim
+            fi
+        elif [ ! -s "$RESOLV_SRC" ]; then
+            # proot 模式只用 $PREFIX/etc/resolv.conf; 不覆盖它 (避免影响 bionic 子进程)
+            echo "!! $RESOLV_SRC 为空, DNS 可能不可用 (可重跑 opencode 或检查 dns53)" >&2
         fi
         # 自动更新: 启动前检查最新版本, 但按时间戳节流 (默认 6 小时一次),
         # 避免每次启动都等 10 秒网络超时; 失败也记时间戳, 离线时不反复卡。
@@ -1400,18 +1524,23 @@ case "${1:-}" in
                 fi
             fi
         fi
-        # exec 不能调 bash 函数, 内联逻辑
+        # exec 不能调 bash 函数, 先用函数把 RUN_MODE 定好
         RUN_MODE="$(cat "$MODE_FILE" 2>/dev/null || echo native)"
+        # 无存储权限: 改用未打补丁的 .orig + proot 绑定 resolv.conf。
+        # .orig 或 proot 缺失时不硬切, 保持 native 并给出提示 (见 apply_dns_mode)。
+        if [ "$DNS_MODE" = "proot" ] && dns_mode_proot_ready; then
+            RUN_MODE="proot-dns"
+        fi
         # --standalone: 进程内私有服务, 用完就退, 不连常驻后台服务。
         #   OPENCODE_STANDALONE=1 → 强制 standalone
         #   OPENCODE_STANDALONE=0 → 强制后台服务
-        #   未设置 → proot-bind 模式默认 standalone, native 模式用官方默认
+        #   未设置 → proot 系模式默认 standalone, native 模式用官方默认
         #
-        # 为什么 proot-bind 要默认 standalone: 该模式下后台服务
+        # 为什么 proot 系模式要默认 standalone: 该模式下后台服务
         # (opencode serve --service) 起来后客户端能拿到结果, 但进程**不退出**
         # —— 表现为 TUI 里输入 /exit 或按 Ctrl+C 后一直停在
         # "Starting background server…", 只能杀进程。standalone 无此问题。
-        if [ "${OPENCODE_STANDALONE:-unset}" = "unset" ] && [ "$RUN_MODE" = "proot-bind" ]; then
+        if [ "${OPENCODE_STANDALONE:-unset}" = "unset" ] && [ "$RUN_MODE" != "native" ]; then
             OPENCODE_STANDALONE=1
         fi
         # 注意: 部分子命令不接受 --standalone (如 `opencode api GET ...` 会报
@@ -1425,52 +1554,24 @@ case "${1:-}" in
                 fi
                 ;;
         esac
-        if [ "$RUN_MODE" = "native" ]; then
+        if [ "$RUN_MODE" = "proot-dns" ]; then
+            # 无存储权限: 未打补丁的 .orig + proot 把 $PREFIX/etc/resolv.conf
+            # 绑到 /etc/resolv.conf, 完全不碰 /sdcard。
+            proot_bind_exec "$REAL_BIN.orig" "$@"
+        elif [ "$RUN_MODE" = "native" ]; then
             # 原生直跑: interp 已指向 Termux musl loader, 运行库走 LD_LIBRARY_PATH。
             # 没有 proot 层 → 进程能看到真实内核 (6.6.x-...-android...),
             # Bun 会自行禁用有问题的 epoll_pwait2 (见 kernel_needs_proot 注释)。
             exec env -u LD_PRELOAD "LD_LIBRARY_PATH=$MUSL_LIBS" \
                 "SSL_CERT_FILE=${SSL_CERT_FILE:-$PREFIX/etc/tls/cert.pem}" \
                 "$REAL_BIN" "$@"
-        elif [ "$RUN_MODE" = "proot-bind" ] && command -v proot >/dev/null 2>&1; then
-            # 未打补丁的官方二进制: 靠 proot 把运行库绑到标准路径
-            OSOPT=()
-            if kernel_needs_proot; then
-                FAKE_OS="$(fake_osrelease)"
-                if [ -n "$FAKE_OS" ] && [ -f "$FAKE_OS" ]; then
-                    OSOPT=(-k 5.10.0 -b "$FAKE_OS:/proc/sys/kernel/osrelease")
-                else
-                    OSOPT=(-k 5.10.0)
-                fi
-            fi
-            LIBOPT=(-b "${INTERP}:/lib/ld-musl-aarch64.so.1")
-            [ -f "${RPATH}/libstdc++.so.6" ] && LIBOPT+=(-b "${RPATH}/libstdc++.so.6:/usr/lib/libstdc++.so.6")
-            [ -f "${RPATH}/libgcc_s.so.1" ] && LIBOPT+=(-b "${RPATH}/libgcc_s.so.1:/usr/lib/libgcc_s.so.1")
-            DNSOPT=()
-            [ -f "${PREFIX}/etc/resolv.conf" ] && DNSOPT+=(-b "${PREFIX}/etc/resolv.conf:/etc/resolv.conf")
-            exec proot "${OSOPT[@]}" "${LIBOPT[@]}" "${DNSOPT[@]}" "$REAL_BIN" "$@"
-        elif kernel_needs_proot && command -v proot >/dev/null 2>&1; then
-            FAKE_OS="$(fake_osrelease)"
-            OSOPT=()
-            if [ -n "$FAKE_OS" ] && [ -f "$FAKE_OS" ]; then
-                OSOPT=(-b "$FAKE_OS:/proc/sys/kernel/osrelease")
-            fi
-            if [ -f "${PREFIX}/etc/resolv.conf" ]; then
-                exec proot -k 5.10.0 "${OSOPT[@]}" \
-                    -b "${PREFIX}/etc/resolv.conf:/etc/resolv.conf" "$REAL_BIN" "$@"
-            else
-                exec proot -k 5.10.0 "${OSOPT[@]}" "$REAL_BIN" "$@"
-            fi
-        elif root_available; then
-            exec "$REAL_BIN" "$@"
         elif command -v proot >/dev/null 2>&1; then
-            if [ -f "${PREFIX}/etc/resolv.conf" ]; then
-                exec proot -b "${PREFIX}/etc/resolv.conf:/etc/resolv.conf" "$REAL_BIN" "$@"
-            else
-                exec proot "$REAL_BIN" "$@"
-            fi
+            # proot-bind 或其它兜底: 靠 proot 把运行库绑到标准路径
+            proot_bind_exec "$REAL_BIN" "$@"
         else
-            exec "$REAL_BIN" "$@"
+            exec env -u LD_PRELOAD "LD_LIBRARY_PATH=$MUSL_LIBS" \
+                "SSL_CERT_FILE=${SSL_CERT_FILE:-$PREFIX/etc/tls/cert.pem}" \
+                "$REAL_BIN" "$@"
         fi
         ;;
 esac
@@ -1518,7 +1619,15 @@ verify() {
     if [ "$(readlink -f "$PREFIX/bin/opencode" 2>/dev/null)" = "$(readlink -f "$WRAPPER_PATH" 2>/dev/null)" ]; then
         ok "命令链接: $PREFIX/bin/opencode (当前会话立即可用)"
     fi
-    if [ "$mode" = "native" ]; then
+    local dns_mode
+    dns_mode="$(cat "$OPENCODE_DIR/.dns-mode" 2>/dev/null || echo sdcard)"
+    if [ "$dns_mode" = "proot" ]; then
+        if command -v proot >/dev/null 2>&1 && [ -x "$REAL_BIN.orig" ]; then
+            ok "DNS 模式: proot (无存储权限可用; 授权后自动切回 sdcard)"
+        else
+            warn "DNS 模式为 proot, 但缺少 proot 或 $REAL_BIN.orig"
+        fi
+    elif [ "$mode" = "native" ]; then
         [ -f "$MUSL_LOADER" ] && ok "私有 musl loader: $MUSL_LOADER" \
             || warn "私有 musl loader 缺失, DNS 可能不可用"
         [ -s "$RESOLV_SHIM" ] && ok "DNS 配置: $RESOLV_SHIM" \
@@ -1579,6 +1688,14 @@ show_guide() {
     echo "  如果仍提示找不到命令: exec \$SHELL -l 或新开一个会话。"
     echo "  注意: 仅把 Termux 切到后台再点开, 不算新会话, 不会重读 .bashrc。"
     echo
+    if [ "$DNS_MODE_DEFAULT" = "proot" ]; then
+        echo "  DNS: 无存储权限, 已启用 proot 降级模式 (不依赖 /sdcard)"
+        echo "       授予存储权限后会自动切回 sdcard 模式: termux-setup-storage"
+        echo
+    else
+        echo "  DNS: sdcard 模式; 若以后收回存储权限, 启动时会自动切到 proot 模式"
+        echo
+    fi
     echo "  建议的 Android 设置 (防止 Termux 被系统杀后台):"
     echo "    1. 开发者选项 → 停止限制子进程: 开启"
     echo "    2. 系统设置 → 应用 → Termux → 电池: 不优化"
@@ -1642,13 +1759,22 @@ esac
 
 info "opencode-termux 安装脚本 v$SCRIPT_VERSION — 仅支持 Termux aarch64"
 check_environment
+STORAGE_OK=0
 if [ "$NONINTERACTIVE" = "1" ]; then
     info "非交互模式: 跳过 pkg upgrade / 镜像切换 / 存储权限弹窗"
-    ensure_storage_permission 0 || true
+    ensure_storage_permission 0 && STORAGE_OK=1 || true
 else
-    ensure_storage_permission || true
+    ensure_storage_permission && STORAGE_OK=1 || true
     fix_mirror
     upgrade_packages
+fi
+# 拿不到存储权限 → 自动降级到 proot DNS 模式 (安装 proot 作为降级路径)
+if [ "$STORAGE_OK" != "1" ]; then
+    if ensure_proot; then
+        DNS_MODE_DEFAULT="proot"
+        warn "无存储权限: DNS 将走 proot 模式 (不依赖 /sdcard)"
+        warn "  之后授予存储权限会自动切回 sdcard, 无需重装"
+    fi
 fi
 install_dependencies
 install_musl_libs

@@ -99,14 +99,14 @@ MIUI/HyperOS、ColorOS、OriginOS 等定制系统的入口名称不同，按上�
 | 私有 loader | 复制 `ld-musl-aarch64.so.1` 到 `~/.local/opencode/`,把 `/etc/resolv.conf` 改写成 `/sdcard/.oc-resolv` |
 | DNS 修复 | 安装独立的 `dns53` 组件到 `~/.local/share/dns53`;wrapper 启动时同步 `/sdcard/.oc-resolv`;没有存储权限时自动降级到 proot 模式(不依赖 `/sdcard`) |
 | 安装 OpenCode | opencode.ai API 查最新版 (npm view 兜底) → 下载 tarball → **只打 interpreter** → 原生直跑验证 → 换入 |
-| 生成 wrapper | `~/.local/bin/opencode`: 原生直跑、自动查版更新(默认 6 小时节流)、`opencode update`、`--rollback`、`self-update`、`opencode-shared`、关掉官方自动更新、修复 `~/.opencode/bin` PATH 陷阱 |
+| 生成 wrapper | `~/.local/bin/opencode`: 原生直跑、自动查版更新(默认 24 小时节流)、`opencode update`、`--rollback`、`self-update`、`opencode-shared`、关掉官方自动更新、修复 `~/.opencode/bin` PATH 陷阱 |
 | 写入 PATH | `~/.local/bin` 幂等写入 `~/.bashrc`;默认 shell 是 zsh(或已安装 zsh / 已有 `~/.zshrc`)时同时写入 `~/.zshrc`;并创建持久软链 `$PREFIX/bin/opencode → ~/.local/bin/opencode`, 当前会话立即可用(同名文件会先备份) |
 | 验证 | `opencode --version`,并报告运行模式 / DNS 模式 / loader / DNS shim |
 
 ## 使用
 
 ```bash
-opencode                     # 启动: 检查最新版(默认 6 小时一次), 非最新自动更新再启动
+opencode                     # 启动: 检查最新版(默认 24 小时一次), 非最新自动更新再启动
 opencode update              # 立即检查并更新到最新版
 opencode update --force      # 已最新也强制重装
 opencode --rollback          # 回滚到上一版 (last-good)
@@ -117,8 +117,10 @@ node ~/.local/share/dns53/dnsq.js api.deepseek.com   # 单点解析测试
 bash <(curl -fsSL …/install.sh) --uninstall  # 卸载
 ```
 
-启动检查的时间戳写在 `~/.local/opencode/.last-update-check`，默认 **6 小时**内只查一次，
-不会再出现每次启动都等 10 秒的情况；检查失败也计时，离线时不会反复卡住。
+启动检查的时间戳写在 `~/.local/opencode/.last-update-check`（epoch 秒，**持久化在磁盘上**），
+默认 **24 小时**内只查一次。这不是进程内计时器：关掉 Termux、重启手机都不会重置，
+只有到期（或你手动 `opencode update`）才会再查。检查成功才记满 24 小时；失败（断网等）
+只等 1 小时再试，既不会每次启动都卡，也不会因为一次离线就白等一整天。
 想立即检查用 `OPENCODE_UPDATE_CHECK_INTERVAL=0 opencode`（或直接 `opencode update`），
 完全关闭用 `OPENCODE_NO_AUTO_UPDATE=1 opencode`。
 
@@ -149,7 +151,7 @@ bash <(curl -fsSL …/install.sh) --uninstall  # 卸载
 ### 安装脚本自身的更新
 
 仓库根目录有 `VERSION`，安装时会写到 `~/.local/opencode/.installer-version`。
-启动检查复用同一个 6 小时节流，顺带拉一次这个十几字节的文件；发现新版本只打印一行提示：
+启动检查复用同一个 24 小时节流，顺带拉一次这个十几字节的文件；发现新版本只打印一行提示：
 
 ```
 ⚠ 安装脚本有更新 (2026.10.20.1 → 2026.10.26.1)

@@ -9,7 +9,7 @@
 #   bash <(curl -fsSL …/install.sh) --yes    # 非交互更新 (跳过 pkg upgrade 等)
 #
 # 安装脚本自身也有版本号 (见下方 SCRIPT_VERSION, 需与仓库根目录 VERSION 同步),
-# wrapper 启动时会按 6 小时节流检查脚本更新并提示 opencode self-update。
+# wrapper 启动时会按 24 小时节流检查脚本更新并提示 opencode self-update。
 #
 # V1 vs V2:
 #   V1 走 GitHub Releases, V2 起官方改用 npm 分发 —— 本仓库跟随 V2;
@@ -37,7 +37,7 @@ PREFIX="${PREFIX:-/data/data/com.termux/files/usr}"
 HOME_DIR="${HOME:-/data/data/com.termux/files/home}"
 # 安装脚本自身版本: 每次改本脚本时递增, 并同步仓库根目录的 VERSION 文件。
 # wrapper 用它判断"脚本是否有更新" (只提示, 不自动执行, 见下)。
-SCRIPT_VERSION="2026.10.26.3"
+SCRIPT_VERSION="2026.10.29.1"
 # 本次安装选定的 DNS 模式: sdcard (默认) / proot (无存储权限)
 DNS_MODE_DEFAULT="sdcard"
 OPENCODE_DIR="$HOME_DIR/.local/opencode"
@@ -798,7 +798,7 @@ write_wrapper() {
 # Env:
 #   OPENCODE_NO_AUTO_UPDATE=1   启动时不检查更新 (含安装脚本更新提示)
 #   OPENCODE_UPDATE_CHECK_INTERVAL
-#                               启动检查的最小间隔 (秒, 默认 21600 = 6 小时;
+#                               启动检查的最小间隔 (秒, 默认 86400 = 24 小时;
 #                               0 = 每次启动都检查)
 #   OPENCODE_AUTO_UPDATE_INSTALLER=1
 #                               发现安装脚本更新时自动执行 (默认只提示;
@@ -823,11 +823,12 @@ DNS_MODE_FILE="$BIN_DIR/.dns-mode"
 # 仅记录"自动降级到 proot"这个事实, 用来在权限恢复时提示一次。
 DNS_FALLBACK_MARK="$BIN_DIR/.dns-fallback"
 DNS_MODE="sdcard"
-# 启动检查的节流时间戳: 距上次检查不足间隔就跳过, 避免每次启动都等网络。
+# 启动检查的节流时间戳。持久化在磁盘上, 不是进程内计时器:
+# 杀掉 Termux / 重开 App 都不会重置它, 只有到点才会再查一次。
 UPDATE_CHECK_STAMP="$BIN_DIR/.last-update-check"
-UPDATE_CHECK_INTERVAL="${OPENCODE_UPDATE_CHECK_INTERVAL:-21600}"
+UPDATE_CHECK_INTERVAL="${OPENCODE_UPDATE_CHECK_INTERVAL:-86400}"
 case "$UPDATE_CHECK_INTERVAL" in
-    ''|*[!0-9]*) UPDATE_CHECK_INTERVAL=21600 ;;
+    ''|*[!0-9]*) UPDATE_CHECK_INTERVAL=86400 ;;
 esac
 INTERP="$PREFIX/lib/ld-musl-aarch64.so.1"
 RPATH="$PREFIX/lib/musl"
@@ -841,7 +842,7 @@ RESOLV_SHIM="/sdcard/.oc-resolv"
 # V2 起官方走 npm 分发 (不再是 GitHub Releases)
 NPM_PKG="@opencode/cli-linux-arm64-musl"
 UPDATE_API="https://opencode.ai/update/api/latest/cli/npm"
-# 安装脚本自身的版本检查: 只拉十几字节的 VERSION, 复用同一个 6 小时节流。
+# 安装脚本自身的版本检查: 只拉十几字节的 VERSION, 复用同一个 24 小时节流。
 SCRIPT_VERSION_FILE="$BIN_DIR/.installer-version"
 SCRIPT_VERSION_URLS=(
     # gh-proxy 的固定 URL 有几分钟缓存, 加时间戳绕过, 保证新版本立即可见
@@ -1219,21 +1220,34 @@ version_ge() {
 }
 
 # 启动检查节流: 距上次检查不足 UPDATE_CHECK_INTERVAL 就跳过。
-# 失败也写时间戳 (离线时不会每次启动都卡 10 秒), 需要立即检查可设
+# 时间戳是 epoch 秒, 存在 $UPDATE_CHECK_STAMP 里, 与进程生命周期无关:
+# 关掉 Termux、重启手机都不影响, 到期才会再查。
+# 失败也写时间戳 (默认 1 小时后再试, 离线时不会每次启动都卡); 需要立即检查可设
 # OPENCODE_UPDATE_CHECK_INTERVAL=0 或 OPENCODE_NO_AUTO_UPDATE=1。
 update_check_due() {
-    local last now
+    local last now delta
     last="$(cat "$UPDATE_CHECK_STAMP" 2>/dev/null || echo 0)"
     case "$last" in
         ''|*[!0-9]*) last=0 ;;
     esac
     now="$(date +%s)"
-    [ $((now - last)) -ge "$UPDATE_CHECK_INTERVAL" ]
+    delta=$((now - last))
+    # 时间戳在未来 (用户改了系统时间 / 时区): 当作到期, 否则会被卡住一整天
+    [ "$delta" -lt 0 ] && return 0
+    [ "$delta" -ge "$UPDATE_CHECK_INTERVAL" ]
 }
 
+# 记录检查时间。$1=1 成功 (记满一个间隔, 默认 24h);
+# $1=0 失败 (1 小时后再试, 避免离线时每次启动都卡, 又不会白等一整天)。
 mark_update_checked() {
+    local ok="${1:-1}" now
+    now="$(date +%s)"
     mkdir -p "$BIN_DIR" 2>/dev/null || true
-    date +%s >"$UPDATE_CHECK_STAMP" 2>/dev/null || true
+    if [ "$ok" = "0" ]; then
+        printf '%s\n' "$(( now - UPDATE_CHECK_INTERVAL + 3600 ))" >"$UPDATE_CHECK_STAMP" 2>/dev/null || true
+    else
+        printf '%s\n' "$now" >"$UPDATE_CHECK_STAMP" 2>/dev/null || true
+    fi
 }
 
 # 远程安装脚本版本 (仓库根目录 VERSION, 只有十几字节)。
@@ -1491,11 +1505,15 @@ case "${1:-}" in
             # proot 模式只用 $PREFIX/etc/resolv.conf; 不覆盖它 (避免影响 bionic 子进程)
             echo "!! $RESOLV_SRC 为空, DNS 可能不可用 (可重跑 opencode 或检查 dns53)" >&2
         fi
-        # 自动更新: 启动前检查最新版本, 但按时间戳节流 (默认 6 小时一次),
-        # 避免每次启动都等 10 秒网络超时; 失败也记时间戳, 离线时不反复卡。
+        # 自动更新: 启动前检查最新版本, 但按持久化时间戳节流 (默认 24 小时一次),
+        # 避免每次启动都等网络。成功记满 24h, 失败只等 1h 再试。
         if [ "${OPENCODE_NO_AUTO_UPDATE:-0}" != "1" ] && update_check_due; then
             LATEST="$(latest_version 10)" || true
-            mark_update_checked
+            if [ -n "$LATEST" ]; then
+                mark_update_checked 1
+            else
+                mark_update_checked 0
+            fi
             if [ -n "$LATEST" ]; then
                 CURRENT="$(current_version)"
                 if [ -z "$CURRENT" ] || ! version_ge "$CURRENT" "$LATEST"; then
@@ -1504,6 +1522,7 @@ case "${1:-}" in
                         echo "→ 更新完毕, 继续启动 opencode…"
                     else
                         echo "!! 自动更新失败, 继续使用现有版本启动" >&2
+                        mark_update_checked 0
                     fi
                 fi
             fi
@@ -1680,7 +1699,7 @@ show_guide() {
     echo "    opencode self-update      更新安装脚本自身 (发现新版会提示)"
     echo "    opencode-shared serve --service &   启动共享服务"
     echo "    opencode-shared run ...   走共享服务 (不注入 --standalone)"
-    echo "    启动检查默认 6 小时一次; OPENCODE_UPDATE_CHECK_INTERVAL=0 可每次检查"
+    echo "    启动检查默认 24 小时一次; OPENCODE_UPDATE_CHECK_INTERVAL=0 可每次检查"
     echo "    重跑本脚本即更新           (bash <(curl -fsSL …/install.sh))"
     echo "    重跑本脚本 --uninstall    卸载"
     echo
